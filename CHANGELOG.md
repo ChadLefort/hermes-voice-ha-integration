@@ -2,6 +2,11 @@
 
 All notable changes to the hermes-voice-ha-integration project.
 
+## [0.0.9] — 2026-06-14
+
+### Fixed
+- **Conversation agent unselectable on HA 2026.6+** — `supported_languages` now returns the plain string `"*"` instead of the list `["*"]`, matching HA 2026.6+'s expectation for the wildcard language marker. The list form caused the agent to appear greyed out in the Assist pipeline dropdown. ([#31](https://github.com/rusty4444/hermes-voice-ha-integration/pull/31), reported by @AlexPla in [#28](https://github.com/rusty4444/hermes-voice-ha-integration/issues/28))
+
 ## [0.0.8] — 2026-06-03
 
 ### Added
