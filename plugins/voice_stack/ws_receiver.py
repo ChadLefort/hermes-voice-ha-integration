@@ -9,6 +9,7 @@ control actions to the local voice stack tools.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import errno
 import hmac
 import json
@@ -53,6 +54,49 @@ _ASSIST_HISTORY_LOCK = threading.Lock()
 _ASSIST_HISTORY: dict[str, list[dict[str, Any]]] = {}
 _AUDIO_ROUTE_PATH = "/api/hermes/audio/{filename}"
 _ASSIST_AUX_TASK_KEY = "voice_stack_assist"
+_ATEXIT_HOOK_REGISTERED = False
+
+
+def _is_gateway_process() -> bool:
+    """True when this Python process is the Hermes gateway daemon."""
+    return os.environ.get("_HERMES_GATEWAY") == "1"
+
+
+def _gateway_daemon_running() -> bool:
+    """Best-effort check for a separate gateway process (dashboard/CLI guard)."""
+    try:
+        from gateway.status import is_gateway_running
+
+        return bool(is_gateway_running())
+    except Exception:
+        return False
+
+
+def _should_bind_ws_receiver() -> bool:
+    """Return True when this process should own the HA WebSocket listen socket.
+
+    The gateway daemon always binds. Dashboard, chat, and other short-lived
+    Hermes processes skip binding when a gateway is already running so restarts
+    do not fight over port 7860.
+    """
+    if os.getenv("HERMES_HA_WS_ENABLED", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    if os.getenv("HERMES_HA_WS_FORCE_BIND", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+    if _is_gateway_process():
+        return True
+    if _gateway_daemon_running():
+        return False
+    return True
+
+
+def _register_shutdown_hook() -> None:
+    """Release the listen socket before process exit (gateway restart)."""
+    global _ATEXIT_HOOK_REGISTERED
+    if _ATEXIT_HOOK_REGISTERED:
+        return
+    atexit.register(stop_ws_receiver)
+    _ATEXIT_HOOK_REGISTERED = True
 
 
 def _env_float(name: str, default: float) -> float:
@@ -515,6 +559,7 @@ class HermesHAWebSocketServer:
         self._total_connections = 0
         self._connections_lock = threading.Lock()
         self._last_error: Optional[str] = None
+        self._listening = False
 
     @property
     def active_connections(self) -> int:
@@ -537,7 +582,11 @@ class HermesHAWebSocketServer:
 
     @property
     def running(self) -> bool:
-        return self._thread is not None and self._thread.is_alive() and self._started.is_set()
+        return (
+            self._listening
+            and self._thread is not None
+            and self._thread.is_alive()
+        )
 
     def start(self) -> bool:
         """Start the receiver in a daemon thread. Returns False if already running."""
@@ -574,6 +623,7 @@ class HermesHAWebSocketServer:
             try:
                 loop.run_until_complete(self._start_async())
                 started_ok = True
+                self._listening = True
                 self._started.set()
                 self._last_error = None
                 backoff = _retry_base_seconds()
@@ -609,6 +659,7 @@ class HermesHAWebSocketServer:
                 )
                 self._started.set()
             finally:
+                self._listening = False
                 try:
                     loop.run_until_complete(self._shutdown())
                 except Exception:
@@ -730,6 +781,8 @@ def _ensure_watchdog() -> None:
 def _watchdog_loop() -> None:
     global _WS_SERVER
     while not _WS_WATCHDOG_STOP.wait(timeout=_watchdog_interval_seconds()):
+        if not _should_bind_ws_receiver():
+            continue
         with _WS_LOCK:
             server = _WS_SERVER
         if server is None:
@@ -750,10 +803,41 @@ def _watchdog_loop() -> None:
             start_ws_receiver()
 
 
+def _adopt_external_receiver(host: str, port: int, path: str, *, reason: str) -> "_AdoptedReceiver":
+    logger.info(
+        "Hermes HA WebSocket receiver on %s:%s managed externally (%s)",
+        host,
+        port,
+        reason,
+    )
+    adopted = _AdoptedReceiver(host, port, path)
+    global _WS_SERVER
+    _WS_SERVER = adopted
+    return adopted
+
+
 def start_ws_receiver(host: Optional[str] = None, port: Optional[int] = None, path: Optional[str] = None) -> Optional["HermesHAWebSocketServer | _AdoptedReceiver"]:
     """Start the singleton HA WebSocket receiver if enabled."""
-    if os.getenv("HERMES_HA_WS_ENABLED", "1").strip().lower() in {"0", "false", "no", "off"}:
-        logger.info("Hermes HA WebSocket receiver disabled by HERMES_HA_WS_ENABLED")
+    global _WS_SERVER
+    if not _should_bind_ws_receiver():
+        resolved_host = host or os.getenv("HERMES_HA_WS_HOST", DEFAULT_WS_HOST)
+        resolved_port = int(port or os.getenv("HERMES_HA_WS_PORT", str(DEFAULT_WS_PORT)))
+        resolved_path = path or os.getenv("HERMES_HA_WS_PATH", DEFAULT_WS_PATH)
+        with _WS_LOCK:
+            if _WS_SERVER and _WS_SERVER.running:
+                return _WS_SERVER
+            if _probe_existing_receiver(resolved_host, resolved_port):
+                return _adopt_external_receiver(
+                    resolved_host,
+                    resolved_port,
+                    resolved_path,
+                    reason="gateway owns bind in this profile",
+                )
+        logger.info(
+            "Hermes HA WebSocket receiver bind skipped in this process; "
+            "start `hermes gateway` to serve Home Assistant on port %s",
+            resolved_port,
+        )
         return None
     if not AIOHTTP_AVAILABLE:
         logger.warning("Hermes HA WebSocket receiver unavailable: aiohttp is not installed")
@@ -763,33 +847,33 @@ def start_ws_receiver(host: Optional[str] = None, port: Optional[int] = None, pa
     resolved_port = int(port or os.getenv("HERMES_HA_WS_PORT", str(DEFAULT_WS_PORT)))
     resolved_path = path or os.getenv("HERMES_HA_WS_PATH", DEFAULT_WS_PATH)
 
-    global _WS_SERVER
     with _WS_LOCK:
         if _WS_SERVER and _WS_SERVER.running:
             return _WS_SERVER
         if _probe_existing_receiver(resolved_host, resolved_port):
-            logger.info(
-                "Hermes HA WebSocket receiver already active on %s:%s; adopting external listener",
+            adopted = _adopt_external_receiver(
                 resolved_host,
                 resolved_port,
+                resolved_path,
+                reason="listener already active",
             )
-            _WS_SERVER = _AdoptedReceiver(resolved_host, resolved_port, resolved_path)
             _ensure_watchdog()
-            return _WS_SERVER
+            return adopted
         _WS_SERVER = HermesHAWebSocketServer(resolved_host, resolved_port, resolved_path)
         _WS_SERVER.start()
         if _WS_SERVER.running:
+            _register_shutdown_hook()
             _ensure_watchdog()
             return _WS_SERVER
         if _probe_existing_receiver(resolved_host, resolved_port):
-            logger.info(
-                "Hermes HA WebSocket local bind failed but external listener is healthy on %s:%s",
+            adopted = _adopt_external_receiver(
                 resolved_host,
                 resolved_port,
+                resolved_path,
+                reason="local bind failed but external listener is healthy",
             )
-            _WS_SERVER = _AdoptedReceiver(resolved_host, resolved_port, resolved_path)
             _ensure_watchdog()
-            return _WS_SERVER
+            return adopted
         return None
 
 

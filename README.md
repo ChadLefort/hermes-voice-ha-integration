@@ -734,7 +734,13 @@ HERMES_VOICE_CACHE=/data/hermes/voice_cache
 
 ### Port `7860` is already in use
 
-Only one process in the container or host can bind `0.0.0.0:7860`. If the HA WebSocket receiver logs `address already in use`, check whether another Hermes process or an old container is already listening on that port, then stop the duplicate process or move one receiver to a different `HERMES_HA_WS_PORT` and update the Hermes URL in the HA integration accordingly.
+Only one process should bind `0.0.0.0:7860` for Home Assistant. When you run **both** `hermes gateway` and `hermes dashboard`, the gateway owns port 7860 automatically — the dashboard adopts the gateway's listener instead of competing for the port.
+
+If you still see `address already in use`:
+
+1. Confirm the gateway is running: `hermes gateway status`
+2. Restart the gateway (not the dashboard): `hermes gateway restart`
+3. As a last resort, set `HERMES_HA_WS_FORCE_BIND=1` on one process only, or move the receiver to a different `HERMES_HA_WS_PORT` and update the Hermes URL in the HA integration.
 
 ### Service call denied
 

@@ -1077,6 +1077,50 @@ class TestVoiceWebSocketReceiverHardening:
             status = receiver_status(adopted)
         assert status["adopted"] is True
 
+    def test_should_bind_true_for_gateway_process(self, monkeypatch):
+        from plugins.voice_stack import ws_receiver
+
+        monkeypatch.delenv("HERMES_HA_WS_ENABLED", raising=False)
+        monkeypatch.delenv("HERMES_HA_WS_FORCE_BIND", raising=False)
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        monkeypatch.setattr(ws_receiver, "_gateway_daemon_running", lambda: True)
+        assert ws_receiver._should_bind_ws_receiver() is True
+
+    def test_should_bind_false_for_dashboard_when_gateway_running(self, monkeypatch):
+        from plugins.voice_stack import ws_receiver
+
+        monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+        monkeypatch.delenv("HERMES_HA_WS_FORCE_BIND", raising=False)
+        monkeypatch.setattr(ws_receiver, "_gateway_daemon_running", lambda: True)
+        assert ws_receiver._should_bind_ws_receiver() is False
+
+    def test_should_bind_true_when_no_gateway_running(self, monkeypatch):
+        from plugins.voice_stack import ws_receiver
+
+        monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+        monkeypatch.setattr(ws_receiver, "_gateway_daemon_running", lambda: False)
+        assert ws_receiver._should_bind_ws_receiver() is True
+
+    def test_start_ws_receiver_skips_bind_when_gateway_owns_port(self, monkeypatch):
+        from plugins.voice_stack import ws_receiver
+
+        monkeypatch.setattr(ws_receiver, "_WS_SERVER", None)
+        monkeypatch.setattr(ws_receiver, "_should_bind_ws_receiver", lambda: False)
+        monkeypatch.setattr(ws_receiver, "_probe_existing_receiver", lambda *a, **k: False)
+
+        assert ws_receiver.start_ws_receiver(host="0.0.0.0", port=7860) is None
+
+    def test_start_ws_receiver_adopts_when_gateway_owns_port(self, monkeypatch):
+        from plugins.voice_stack import ws_receiver
+
+        monkeypatch.setattr(ws_receiver, "_WS_SERVER", None)
+        monkeypatch.setattr(ws_receiver, "_should_bind_ws_receiver", lambda: False)
+        monkeypatch.setattr(ws_receiver, "_probe_existing_receiver", lambda *a, **k: True)
+
+        server = ws_receiver.start_ws_receiver(host="0.0.0.0", port=7860, path="/api/hermes/ws")
+        assert isinstance(server, ws_receiver._AdoptedReceiver)
+        assert server.running is True
+
 
 class TestHermesServices:
     """Custom component services.py tests."""

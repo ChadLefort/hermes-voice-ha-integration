@@ -61,8 +61,19 @@ module-level singleton `_WS_SERVER`.
 | `API_SERVER_KEY` | fallback: shared Hermes API server key |
 | `HERMES_API_KEY` | fallback: main Hermes API key |
 | `HERMES_HA_WS_ENABLED` | set to `0`/`false`/`no`/`off` to disable entirely |
+| `HERMES_HA_WS_FORCE_BIND` | set to `1`/`true` to force this process to bind even when gateway is running |
 
 Priority: `HERMES_HA_WS_TOKEN` > `API_SERVER_KEY` > `HERMES_API_KEY` > no-token (open).
+
+## Process ownership (gateway vs dashboard)
+
+Port `7860` is for **Home Assistant → Hermes** (`/api/hermes/ws`). The Hermes
+**dashboard** uses its own port (typically `9119`) for browser UI websockets.
+
+When both `hermes gateway` and `hermes dashboard` load `voice_stack`, only the
+gateway binds `7860`. The dashboard detects a running gateway and **adopts** the
+existing listener instead of competing for the port. Gateway restart releases
+the socket via an `atexit` hook so systemd restarts do not wedge the port.
 
 If no token is configured, `_auth_ok({})` returns `True` immediately; the WS
 handshake is unauthenticated.
