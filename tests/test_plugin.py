@@ -308,7 +308,7 @@ class TestPluginRegistration:
         with open(yaml_path) as f:
             data = yaml.safe_load(f)
         assert data["name"] == "home_assistant"
-        assert data["version"] == "0.0.10"
+        assert data["version"] == "0.0.11"
         assert "on_session_start" in data["hooks"]
 
     def test_voice_stack_plugin_yaml_valid(self):
@@ -318,7 +318,7 @@ class TestPluginRegistration:
         with open(yaml_path) as f:
             data = yaml.safe_load(f)
         assert data["name"] == "voice_stack"
-        assert data["version"] == "0.0.10"
+        assert data["version"] == "0.0.11"
 
 
 # ---------------------------------------------------------------------------
@@ -558,7 +558,7 @@ class TestObservability:
         assert data["domain"] == "hermes"
         assert data["config_flow"] is True
         assert "iot_class" in data
-        assert data["version"] == "0.0.10"
+        assert data["version"] == "0.0.11"
 
     def test_config_flow_translations_are_packaged_for_ha_ui(self):
         """HA must ship runtime translations, not only source strings.json."""
@@ -607,7 +607,7 @@ class TestAddonStructure:
         with open(config_path) as f:
             data = yaml.safe_load(f)
         assert data["name"] == "Hermes Voice Assistant"
-        assert data["version"] == "0.0.10"
+        assert data["version"] == "0.0.11"
         assert data["slug"] == "hermes_voice"
         assert "arch" in data
         assert "amd64" in data["arch"] or "aarch64" in data["arch"]
@@ -826,7 +826,7 @@ class TestVoicePluginInit:
         assert "HERMES_WAKE_WORD_ENGINE" in data["config"]
         assert "HERMES_HA_WS_PORT" in data["config"]
         assert "HERMES_HA_WS_TOKEN" in data["config"]
-        assert data["version"] == "0.0.10"
+        assert data["version"] == "0.0.11"
 
     def test_register_exposes_voice_stack_assist_auxiliary_task(self):
         import plugins.voice_stack as voice_stack
@@ -1009,6 +1009,73 @@ class TestVoiceWebSocketReceiver:
         assert model == "gpt-5.4-mini"
         assert seen["requested"] == "openai-codex"
         assert seen["target_model"] == "gpt-5.4-mini"
+
+
+class TestVoiceWebSocketReceiverHardening:
+    """Resilience tests for the HA-facing WebSocket receiver."""
+
+    def setup_method(self) -> None:
+        from plugins.voice_stack import ws_receiver
+
+        ws_receiver._HEALTH_PROBE_CACHE.clear()
+
+    def test_probe_existing_receiver_accepts_healthy_payload(self, monkeypatch):
+        from plugins.voice_stack import ws_receiver
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {"service": "hermes-ha-ws", "running": True, "ok": True}
+                ).encode("utf-8")
+
+        monkeypatch.setattr(ws_receiver.urllib.request, "urlopen", lambda *a, **k: FakeResponse())
+        assert ws_receiver._probe_existing_receiver("0.0.0.0", 7860) is True
+
+    def test_probe_existing_receiver_rejects_foreign_service(self, monkeypatch):
+        from plugins.voice_stack import ws_receiver
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps({"service": "other", "running": True}).encode("utf-8")
+
+        monkeypatch.setattr(ws_receiver.urllib.request, "urlopen", lambda *a, **k: FakeResponse())
+        assert ws_receiver._probe_existing_receiver("0.0.0.0", 7860) is False
+
+    def test_start_ws_receiver_adopts_existing_listener(self, monkeypatch):
+        from plugins.voice_stack import ws_receiver
+
+        monkeypatch.setattr(ws_receiver, "_WS_SERVER", None)
+        monkeypatch.setattr(ws_receiver, "_WS_WATCHDOG", None)
+        monkeypatch.setattr(ws_receiver, "_probe_existing_receiver", lambda *a, **k: True)
+        monkeypatch.setattr(ws_receiver, "_ensure_watchdog", lambda: None)
+
+        server = ws_receiver.start_ws_receiver(host="0.0.0.0", port=7860, path="/api/hermes/ws")
+        assert isinstance(server, ws_receiver._AdoptedReceiver)
+        assert server.running is True
+
+        status = ws_receiver.receiver_status(server)
+        assert status["adopted"] is True
+        assert status["running"] is True
+
+    def test_receiver_status_reports_adopted_flag(self):
+        from plugins.voice_stack.ws_receiver import _AdoptedReceiver, receiver_status
+
+        adopted = _AdoptedReceiver("0.0.0.0", 7860, "/api/hermes/ws")
+        with patch("plugins.voice_stack.ws_receiver._probe_existing_receiver", return_value=True):
+            status = receiver_status(adopted)
+        assert status["adopted"] is True
 
 
 class TestHermesServices:
@@ -1300,7 +1367,7 @@ class TestCHANGELOG:
     def test_changelog_has_version_entries(self):
         cl = Path(__file__).parent.parent / "CHANGELOG.md"
         content = cl.read_text()
-        assert "## [0.0.10]" in content
+        assert "## [0.0.11]" in content
         assert "## [0.0.7]" in content
         assert "## [0.0.6]" in content
 

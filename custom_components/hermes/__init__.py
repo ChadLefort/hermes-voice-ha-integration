@@ -36,6 +36,10 @@ PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.CONVERSATION]
 _PUSH_INTERVAL = timedelta(seconds=0.2)
 _LAST_PUSH: dict[str, float] = {}
 
+# WebSocket reconnect backoff (seconds)
+_RECONNECT_MIN_SECONDS = 1.0
+_RECONNECT_MAX_SECONDS = 60.0
+
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the Hermes integration via configuration.yaml (legacy)."""
@@ -70,6 +74,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Connect WebSocket to Hermes Agent
     await bridge.async_connect()
+    bridge.async_start_reconnect_loop()
 
     # Register state-change listener. Home Assistant does not accept None as
     # entity_ids; when no filter is configured, listen for all state_changed
@@ -156,6 +161,10 @@ class HermesBridge:
         self._total_errors = 0
         self._voice_ready = False
         self._reader_task: asyncio.Task | None = None
+        self._reconnect_task: asyncio.Task | None = None
+        self._connect_lock = asyncio.Lock()
+        self._shutting_down = False
+        self._reconnect_delay = _RECONNECT_MIN_SECONDS
         # Map of conversation_id → asyncio.Future for routing Hermes responses
         self._pending_queries: dict[str, asyncio.Future] = {}
 
@@ -224,49 +233,90 @@ class HermesBridge:
 
     async def async_connect(self) -> None:
         """Connect to Hermes Agent WebSocket."""
-        import ssl as _ssl
+        if self._shutting_down:
+            return
 
-        ssl_context: _ssl.SSLContext | None = None
-        if not self.verify_ssl:
-            ssl_context = _ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = _ssl.CERT_NONE
-            if self.hermes_token:
-                _LOGGER.warning(
-                    "Hermes token configured with verify_ssl=False — "
-                    "token will be sent over plaintext"
+        async with self._connect_lock:
+            await self._close_transport()
+
+            import ssl as _ssl
+
+            ssl_context: _ssl.SSLContext | None = None
+            if not self.verify_ssl:
+                ssl_context = _ssl.create_default_context()
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = _ssl.CERT_NONE
+                if self.hermes_token:
+                    _LOGGER.warning(
+                        "Hermes token configured with verify_ssl=False — "
+                        "token will be sent over plaintext"
+                    )
+
+            try:
+                self._session = aiohttp.ClientSession()
+                headers = {}
+                if self.hermes_token:
+                    headers["Authorization"] = f"Bearer {self.hermes_token}"
+                url = f"{self.hermes_url}/api/hermes/ws"
+                self._ws = await self._session.ws_connect(
+                    url,
+                    headers=headers,
+                    ssl=ssl_context,
+                    heartbeat=30,
                 )
+                self._reader_task = asyncio.create_task(self._ws_reader())
+                self._connected = True
+                self._reconnect_delay = _RECONNECT_MIN_SECONDS
+                _LOGGER.info("Connected to Hermes WebSocket at %s", self.hermes_url)
+                await _flush_pending(self._ws, self._pending)
+            except Exception as exc:
+                _LOGGER.warning("Failed to connect to Hermes WebSocket: %s", exc)
+                self._connected = False
+                await self._close_transport()
 
-        # Cancel any previous reader task before creating a new connection
+    async def _close_transport(self) -> None:
+        """Close the active WebSocket transport without stopping background reconnect."""
         if self._reader_task and not self._reader_task.done():
             self._reader_task.cancel()
             try:
                 await self._reader_task
             except asyncio.CancelledError:
                 pass
+            self._reader_task = None
+        if self._ws is not None:
+            await self._ws.close()
+            self._ws = None
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
+        self._connected = False
 
-        try:
-            self._session = aiohttp.ClientSession()
-            headers = {}
-            if self.hermes_token:
-                headers["Authorization"] = f"Bearer {self.hermes_token}"
-            # Token in query param removed: use Authorization header instead
-            url = f"{self.hermes_url}/api/hermes/ws"
-            self._ws = await self._session.ws_connect(
-                url,
-                headers=headers,
-                ssl=ssl_context,
-                heartbeat=30,
+    def async_start_reconnect_loop(self) -> None:
+        """Keep trying to reconnect when the Hermes WebSocket drops."""
+        if self._shutting_down:
+            return
+        if self._reconnect_task and not self._reconnect_task.done():
+            return
+        self._reconnect_task = asyncio.create_task(self._reconnect_loop())
+
+    async def _reconnect_loop(self) -> None:
+        """Background task: reconnect with exponential backoff."""
+        while not self._shutting_down:
+            await asyncio.sleep(self._reconnect_delay)
+            if self._shutting_down or self._connected:
+                if self._connected:
+                    self._reconnect_delay = _RECONNECT_MIN_SECONDS
+                continue
+            _LOGGER.info(
+                "Hermes WebSocket disconnected; reconnecting in %.1fs",
+                self._reconnect_delay,
             )
-            # Start background reader; set _connected only after reader launches
-            self._reader_task = asyncio.create_task(self._ws_reader())
-            self._connected = True
-            _LOGGER.info("Connected to Hermes WebSocket at %s", self.hermes_url)
-            # Flush any pending messages queued while disconnected
-            await _flush_pending(self._ws, self._pending)
-        except Exception as exc:
-            _LOGGER.warning("Failed to connect to Hermes WebSocket: %s", exc)
-            self._connected = False
+            await self.async_connect()
+            if not self._connected:
+                self._reconnect_delay = min(
+                    self._reconnect_delay * 2,
+                    _RECONNECT_MAX_SECONDS,
+                )
 
 
     async def _ws_reader(self) -> None:
@@ -308,11 +358,12 @@ class HermesBridge:
             _LOGGER.warning("Hermes WS reader exception: %s", exc)
         finally:
             self._connected = False
-            # Resolve any pending futures as failed
             for future in self._pending_queries.values():
                 if not future.done():
                     future.set_exception(ConnectionError("Hermes WebSocket disconnected"))
             self._pending_queries.clear()
+            if not self._shutting_down:
+                self.async_start_reconnect_loop()
 
     async def async_send_conversation_query(
         self,
@@ -344,6 +395,10 @@ class HermesBridge:
             _LOGGER.info("Hermes WS not connected for conversation query; attempting reconnect")
             await self.async_connect()
 
+        if not (self._connected and self._ws):
+            await asyncio.sleep(min(self._reconnect_delay, 2.0))
+            await self.async_connect()
+
         if self._connected and self._ws:
             try:
                 await self._ws.send_json(payload)
@@ -364,20 +419,16 @@ class HermesBridge:
 
     async def async_shutdown(self) -> None:
         """Clean up connections."""
+        self._shutting_down = True
         self._connected = False
-        if self._reader_task and not self._reader_task.done():
-            self._reader_task.cancel()
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
             try:
-                await self._reader_task
+                await self._reconnect_task
             except asyncio.CancelledError:
                 pass
-            self._reader_task = None
-        if self._ws:
-            await self._ws.close()
-            self._ws = None
-        if self._session:
-            await self._session.close()
-            self._session = None
+            self._reconnect_task = None
+        await self._close_transport()
 
     async def async_relay_command(self, command: dict[str, Any]) -> dict[str, Any]:
         """Relay a Hermes voice/control command over the Hermes WebSocket."""

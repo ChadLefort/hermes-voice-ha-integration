@@ -2,6 +2,18 @@
 
 All notable changes to the hermes-voice-ha-integration project.
 
+## [0.0.11] — 2026-06-15
+
+### Added
+- `auxiliary.voice_stack_assist` slot so Home Assistant Assist queries can use a cheaper model than the main Hermes agent.
+- HA WebSocket receiver resilience: auto-retry with backoff, port adoption when another Hermes process already owns `:7860`, and a watchdog that restarts a dead receiver.
+- Home Assistant bridge background reconnect loop with exponential backoff and cleaner session teardown.
+
+### Fixed
+- HA Assist sessions no longer always fall back to the main model when `voice_stack_assist` is configured.
+- WebSocket receiver bind failures (`address already in use`) between dashboard and gateway no longer leave HA permanently disconnected.
+- Wake-word pipeline hardening and clearer unavailable-state handling for continuous voice mode.
+
 ## [0.0.10] — 2026-06-15
 
 ### Added

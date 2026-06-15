@@ -42,6 +42,14 @@ def test_bridge_normalizes_wake_word_and_forwards_voice_args() -> None:
     assert '**dict(command.get("args") or {})' in source
 
 
+def test_bridge_reconnect_loop_is_started_and_used() -> None:
+    source = _source("custom_components/hermes/__init__.py")
+    assert "bridge.async_start_reconnect_loop()" in source
+    assert "async def _reconnect_loop(self)" in source
+    assert "async def _close_transport(self)" in source
+    assert "self._connect_lock = asyncio.Lock()" in source
+
+
 def test_empty_entity_filter_tracks_all_state_changes_without_none() -> None:
     source = _source("custom_components/hermes/__init__.py")
     assert "entity_filter = normalize_list(" in source
