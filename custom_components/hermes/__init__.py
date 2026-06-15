@@ -340,6 +340,10 @@ class HermesBridge:
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending_queries[conversation_id] = future
 
+        if not (self._connected and self._ws):
+            _LOGGER.info("Hermes WS not connected for conversation query; attempting reconnect")
+            await self.async_connect()
+
         if self._connected and self._ws:
             try:
                 await self._ws.send_json(payload)

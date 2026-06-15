@@ -15,9 +15,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
 import threading
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -34,20 +35,90 @@ _stt_engine: Optional[Any] = None
 _tts_engine: Optional[Any] = None
 
 
+def _load_main_tts_config() -> Dict[str, Any]:
+    """Best-effort read of Hermes' main ``tts:`` config block.
+
+    The voice_stack plugin historically relied only on ``HERMES_TTS_*`` env
+    vars, which diverged from Hermes' built-in ``text_to_speech`` tool that
+    reads ``config.yaml``. That made local Piper setups look broken even when
+    Hermes itself could already synthesize audio.
+    """
+    hermes_home = Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes")))
+    config_path = hermes_home / "config.yaml"
+    if not config_path.is_file():
+        return {}
+    try:
+        import yaml
+        data = yaml.safe_load(config_path.read_text()) or {}
+    except Exception as exc:
+        logger.debug("Could not read Hermes config for voice_stack TTS fallback: %s", exc)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    tts_cfg = data.get("tts")
+    return tts_cfg if isinstance(tts_cfg, dict) else {}
+
+
+def _parse_command_env(*env_names: str) -> List[str]:
+    for env_name in env_names:
+        raw = os.getenv(env_name, "").strip()
+        if raw:
+            try:
+                parsed = shlex.split(raw)
+            except ValueError as exc:
+                logger.warning("Invalid %s command: %s", env_name, exc)
+                continue
+            if parsed:
+                return parsed
+    return []
+
+
+def _parse_model_paths(raw: str) -> List[str]:
+    if not raw:
+        return []
+    parts = [part.strip() for part in raw.replace(os.pathsep, ",").split(",")]
+    return [part for part in parts if part]
+
+
 def _get_config() -> Dict[str, Any]:
-    """Load voice stack config from plugin.yaml or env."""
+    """Load voice stack config from env with fallback to Hermes config.yaml."""
+    main_tts = _load_main_tts_config()
+    configured_tts_engine = str(
+        os.getenv("HERMES_TTS_ENGINE") or main_tts.get("provider") or "edge"
+    ).strip().lower()
+    tts_engine = configured_tts_engine if configured_tts_engine in {"edge", "piper", "command"} else "edge"
+    env_tts_voice = os.getenv("HERMES_TTS_VOICE", "").strip()
+    if env_tts_voice:
+        tts_voice = env_tts_voice
+    elif configured_tts_engine == "piper":
+        piper_raw = main_tts.get("piper")
+        piper_cfg: Dict[str, Any] = piper_raw if isinstance(piper_raw, dict) else {}
+        tts_voice = str(piper_cfg.get("voice") or "en_US-lessac-medium")
+    else:
+        edge_raw = main_tts.get("edge")
+        edge_cfg: Dict[str, Any] = edge_raw if isinstance(edge_raw, dict) else {}
+        tts_voice = str(edge_cfg.get("voice") or "en-US-AriaNeural")
+
+    wake_word_command = _parse_command_env("HERMES_WAKE_WORD_COMMAND", "HERMES_MIROWAKEWORD_COMMAND")
+    wake_word_model_paths = _parse_model_paths(
+        os.getenv("HERMES_WAKE_WORD_MODEL_PATHS") or os.getenv("HERMES_WAKE_WORD_MODEL_PATH", "")
+    )
+
     return {
         "wake_word": {
-            "engine": os.getenv("HERMES_WAKE_WORD_ENGINE", "porcupine"),
+            "engine": os.getenv("HERMES_WAKE_WORD_ENGINE", "auto"),
             "keyword": os.getenv("HERMES_WAKE_WORD", "computer"),
+            "model_paths": wake_word_model_paths,
+            "command": wake_word_command,
+            "threshold": float(os.getenv("HERMES_WAKE_WORD_THRESHOLD", "0.5")),
         },
         "stt": {
             "engine": os.getenv("HERMES_STT_ENGINE", "faster-whisper"),
             "model_size": os.getenv("HERMES_STT_MODEL", "tiny"),
         },
         "tts": {
-            "engine": os.getenv("HERMES_TTS_ENGINE", "edge"),
-            "voice": os.getenv("HERMES_TTS_VOICE", "en-US-AriaNeural"),
+            "engine": tts_engine,
+            "voice": tts_voice,
         },
         "media_player_entity": os.getenv("HERMES_MEDIA_PLAYER", ""),
         "max_record_duration": float(os.getenv("HERMES_RECORD_DURATION", "10")),
@@ -60,6 +131,7 @@ def _init_engines() -> bool:
     """Initialise TTS + STT engines from config. Returns True if both ready."""
     global _tts_engine, _stt_engine, _wake_word_engine
     config = _get_config()
+    _voice_ready.clear()
 
     # TTS
     from .engines.tts import create_tts_engine
@@ -83,12 +155,16 @@ def _init_engines() -> bool:
         logger.warning("STT engine init failed: %s", exc)
         _stt_engine = None
 
-    # Wake Word (optional — voice mode works without it via voice_listen)
+    # Wake Word (optional for the plugin overall, required for continuous mode)
     from .engines.wake_word import create_wake_word_engine
     try:
         _wake_word_engine = create_wake_word_engine(
             engine_type=config["wake_word"]["engine"],
             keywords=[config["wake_word"]["keyword"]],
+            wake_words=[config["wake_word"]["keyword"]],
+            model_paths=config["wake_word"].get("model_paths"),
+            command=config["wake_word"].get("command"),
+            threshold=config["wake_word"].get("threshold", 0.5),
         )
     except Exception as exc:
         logger.warning("Wake word engine init failed: %s", exc)
@@ -96,7 +172,8 @@ def _init_engines() -> bool:
 
     tts_ok = _tts_engine is not None and _tts_engine.available()
     stt_ok = _stt_engine is not None and _stt_engine.available()
-    logger.info("Voice engines: TTS=%s STT=%s WakeWord=%s", tts_ok, stt_ok, _wake_word_engine is not None)
+    wake_ok = _wake_word_engine is not None and _wake_word_engine.available()
+    logger.info("Voice engines: TTS=%s STT=%s WakeWord=%s", tts_ok, stt_ok, wake_ok)
 
     if tts_ok and stt_ok:
         _voice_ready.set()
@@ -170,35 +247,46 @@ def _handle_voice_enable(args: dict, **kw) -> str:
             "error": "Voice engines not available. Check voice_status for details.",
         })
 
+    config = _get_config()
+    wake_word_engine_name = str(config["wake_word"].get("engine") or "auto")
+    wake_word_available = False
+    if _wake_word_engine is not None:
+        available_fn = getattr(_wake_word_engine, "available", None)
+        try:
+            wake_word_available = bool(available_fn()) if callable(available_fn) else True
+        except Exception:
+            wake_word_available = False
+    if not wake_word_available:
+        return json.dumps({
+            "ok": False,
+            "error": (
+                "Wake word engine is not available for continuous voice mode. "
+                f"Configured engine: {wake_word_engine_name}. "
+                "Use HERMES_WAKE_WORD_ENGINE=auto, openwakeword, mirowakeword, command, or disabled."
+            ),
+            "error_category": "wake_word_unavailable",
+        })
+
     with _pipeline_lock:
         if _pipeline and _pipeline.state.enabled:
             return json.dumps({"ok": True, "message": "Voice mode already enabled."})
 
-        config = _get_config()
         media_player = args.get("media_player_entity") or config["media_player_entity"] or None
 
         from .pipeline import VoicePipeline
 
-        # Define the callback that sends user text to Hermes
-        # In production this is wired by the Hermes tool dispatch system.
-        # For now, the callback uses the HA tool bridge directly.
+        # Define the callback that sends user text to Hermes.
         def _voice_callback(text: str) -> str:
-            """Called when STT produces text. This is where Hermes processes it."""
+            """Called when STT produces text. Route it through Hermes Assist."""
             logger.info("Voice callback received: %s", text)
             try:
-                from ..home_assistant.ha_assistant import (
-                    search_entities,
-                    call_service,
-                )
+                from .ws_receiver import run_local_assist_query
             except ImportError:
-                return "The Home Assistant bridge is not available."
-            # For P1, delegate the actual LLM processing to the Hermes agent
-            # via a registered hook. The response here is a placeholder —
-            # the Hermes agent loop handles full NLU.
-            return (
-                f"I heard: {text}. "
-                "Voice processing is active — Hermes is listening."
-            )
+                return "The Hermes Assist bridge is not available."
+
+            result = run_local_assist_query(text)
+            response_text = str(result.get("text") or "").strip()
+            return response_text or "I processed that, but I have nothing useful to say."
 
         _pipeline = VoicePipeline(
             callback=_voice_callback,

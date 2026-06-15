@@ -63,9 +63,14 @@ async def async_get_picture_card_content(
 async def async_register_resources(hass) -> None:
     """Serve and register the HermesActionBar card as a dashboard resource."""
     static_path = Path(__file__).parent / "hacsfiles" / "hermes_action_bar.js"
-    await hass.http.async_register_static_paths([
-        StaticPathConfig(_STATIC_URL, str(static_path), cache_headers=True)
-    ])
+    try:
+        await hass.http.async_register_static_paths([
+            StaticPathConfig(_STATIC_URL, str(static_path), cache_headers=True)
+        ])
+    except RuntimeError as exc:
+        if "already registered" not in str(exc):
+            raise
+        _LOGGER.debug("Hermes static resource already registered at %s", _STATIC_URL)
 
     try:
         from homeassistant.components.lovelace import _CONF_RESOURCES as RES_KEY  # type: ignore

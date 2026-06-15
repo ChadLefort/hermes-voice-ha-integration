@@ -12,9 +12,11 @@ import asyncio
 import hmac
 import json
 import logging
+import mimetypes
 import os
 import threading
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional
 
 try:
@@ -40,6 +42,9 @@ _START_TIME = time.monotonic()
 _MESSAGE_COUNTERS: dict[str, int] = {}
 _COUNTER_LOCK = threading.Lock()
 _VOICE_ACTION_RESERVED_KEYS = {"type", "action", "args"}
+_ASSIST_HISTORY_LOCK = threading.Lock()
+_ASSIST_HISTORY: dict[str, list[dict[str, Any]]] = {}
+_AUDIO_ROUTE_PATH = "/api/hermes/audio/{filename}"
 
 
 def _record_message(msg_type: str) -> None:
@@ -101,6 +106,149 @@ def _json_loads_maybe(value: Any) -> dict[str, Any]:
     return {"value": value}
 
 
+def _create_session_db_for_assist():
+    """Best-effort SessionDB for HA Assist queries."""
+    try:
+        from hermes_state import SessionDB
+        return SessionDB()
+    except Exception as exc:
+        logger.debug("SQLite session store not available for HA Assist: %s", exc)
+        return None
+
+
+def _build_assist_system_prompt() -> str:
+    """Return a concise, voice-friendly prompt with optional HA context."""
+    try:
+        from .pipeline import build_voice_system_prompt
+    except Exception:
+        return (
+            "You are Hermes answering Home Assistant Assist requests. "
+            "Respond concisely, naturally, and clearly. Use Home Assistant tools when needed."
+        )
+
+    entities = None
+    try:
+        from ..home_assistant.ha_assistant import search_entities
+        result = search_entities()
+        if isinstance(result, dict):
+            raw_entities = result.get("entities")
+            if isinstance(raw_entities, list):
+                entities = raw_entities[:30]
+    except Exception:
+        entities = None
+
+    return build_voice_system_prompt(areas=None, entities=entities)
+
+
+def run_local_assist_query(
+    text: str,
+    *,
+    conversation_id: Optional[str] = None,
+    language: str = "en",
+) -> dict[str, Any]:
+    """Run one Assist text query through Hermes and return an assist_response payload."""
+    conversation_id = (conversation_id or "").strip() or f"ha-{int(time.time() * 1000)}"
+    original_text = str(text or "")
+    clean_text = original_text.strip()
+    if not clean_text:
+        prompt = "I didn't catch that. Could you repeat?"
+        return {
+            "type": "assist_response",
+            "ok": False,
+            "conversation_id": conversation_id,
+            "text": prompt,
+            "speech": {"plain": {"speech": prompt}},
+        }
+
+    from hermes_cli.config import load_config
+    from hermes_cli.fallback_config import get_fallback_chain
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+    from hermes_cli.tools_config import _get_platform_tools
+    from run_agent import AIAgent
+
+    cfg = load_config()
+    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+    effective_model = ""
+    effective_provider = None
+    if isinstance(model_cfg, dict):
+        effective_model = str(model_cfg.get("default") or model_cfg.get("model") or "").strip()
+        raw_provider = str(model_cfg.get("provider") or "").strip().lower()
+        effective_provider = raw_provider or None
+
+    runtime = resolve_runtime_provider(
+        requested=effective_provider,
+        target_model=effective_model or None,
+    )
+
+    toolsets = set(_get_platform_tools(cfg, "cli"))
+    toolsets.add("homeassistant")
+    session_db = _create_session_db_for_assist()
+    fallback_chain = get_fallback_chain(cfg)
+    system_prompt = _build_assist_system_prompt()
+
+    with _ASSIST_HISTORY_LOCK:
+        history = list(_ASSIST_HISTORY.get(conversation_id) or [])
+
+    agent = AIAgent(
+        api_key=runtime.get("api_key"),
+        base_url=runtime.get("base_url"),
+        provider=runtime.get("provider"),
+        api_mode=runtime.get("api_mode"),
+        model=effective_model,
+        enabled_toolsets=sorted(toolsets),
+        quiet_mode=True,
+        platform="cli",
+        session_db=session_db,
+        credential_pool=runtime.get("credential_pool"),
+        fallback_model=fallback_chain or None,
+        ephemeral_system_prompt=system_prompt,
+    )
+    agent.suppress_status_output = True
+    agent.stream_delta_callback = None
+    agent.tool_gen_callback = None
+
+    if language and language.lower() != "en":
+        clean_text = f"Respond in language code {language}.\n\nUser request: {clean_text}"
+
+    result = agent.run_conversation(
+        user_message=clean_text,
+        conversation_history=history,
+        task_id=f"ha-assist-{conversation_id}",
+        persist_user_message=original_text,
+    )
+
+    final_text = str(result.get("final_response") or result.get("error") or "").strip()
+    if not final_text:
+        final_text = "I processed your request but got no response."
+
+    messages = result.get("messages")
+    if isinstance(messages, list):
+        with _ASSIST_HISTORY_LOCK:
+            _ASSIST_HISTORY[conversation_id] = messages
+
+    return {
+        "type": "assist_response",
+        "ok": not bool(result.get("failed")),
+        "conversation_id": conversation_id,
+        "text": final_text,
+        "speech": {"plain": {"speech": final_text}},
+    }
+
+
+async def handle_assist_query_async(payload: dict[str, Any]) -> dict[str, Any]:
+    """Handle an Assist text query without blocking the aiohttp event loop."""
+    text = str(payload.get("text") or "").strip()
+    conversation_id = str(payload.get("conversation_id") or "").strip() or None
+    language = str(payload.get("language") or "en").strip() or "en"
+    response = await asyncio.to_thread(
+        run_local_assist_query,
+        text,
+        conversation_id=conversation_id,
+        language=language,
+    )
+    return _with_request_id(payload, response)
+
+
 def _configured_token() -> str:
     """Return the optional bearer token accepted by the HA WebSocket endpoint."""
     return (
@@ -121,6 +269,28 @@ def _auth_ok(headers: Mapping[str, str]) -> bool:
         return False
     supplied = auth[7:].strip()
     return hmac.compare_digest(supplied, token)
+
+
+def build_audio_stream_url(audio_path: str) -> str:
+    """Return an externally reachable URL for a synthesized audio file."""
+    filename = Path(audio_path).name
+    base_url = (
+        os.getenv("HERMES_HA_MEDIA_BASE_URL", "").strip()
+        or os.getenv("HERMES_HA_WS_PUBLIC_BASE_URL", "").strip()
+        or os.getenv("HERMES_HA_WS_PUBLIC_URL", "").strip()
+    )
+    if not base_url:
+        host = os.getenv("HERMES_HA_WS_HOST", DEFAULT_WS_HOST).strip() or DEFAULT_WS_HOST
+        port = int(os.getenv("HERMES_HA_WS_PORT", str(DEFAULT_WS_PORT)).strip() or DEFAULT_WS_PORT)
+        if host in {"0.0.0.0", "::", "127.0.0.1", "localhost"}:
+            host = "127.0.0.1"
+        base_url = f"http://{host}:{port}"
+    base_url = base_url.rstrip("/")
+    url = f"{base_url}/api/hermes/audio/{filename}"
+    token = _configured_token()
+    if token:
+        url = f"{url}?token={token}"
+    return url
 
 
 def handle_voice_action(payload: dict[str, Any]) -> dict[str, Any]:
@@ -173,6 +343,13 @@ def handle_ha_ws_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if msg_type == "voice_action":
         result = handle_voice_action(payload)
         return _with_request_id(payload, {"type": "voice_action_result", **result})
+
+    if msg_type == "assist_query":
+        return _with_request_id(payload, {
+            "type": "error",
+            "ok": False,
+            "error": "assist_query must be handled asynchronously",
+        })
 
     if msg_type == "state_changed":
         # P0 receiver behaviour: acknowledge state pushes so HA knows Hermes
@@ -281,6 +458,7 @@ class HermesHAWebSocketServer:
         app = web.Application()
         app.router.add_get(self.path, self._handle_ws)
         app.router.add_get("/health", self._handle_health)
+        app.router.add_get(_AUDIO_ROUTE_PATH, self._handle_audio)
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, self.host, self.port)
@@ -298,6 +476,35 @@ class HermesHAWebSocketServer:
     async def _handle_health(self, request: "aiohttp_web.Request") -> "aiohttp_web.Response":
         assert web is not None
         return web.json_response({"type": "status", **receiver_status(self)})
+
+    async def _handle_audio(self, request: "aiohttp_web.Request") -> "aiohttp_web.StreamResponse":
+        assert web is not None
+        token = _configured_token()
+        if token:
+            provided = str(request.query.get("token", ""))
+            if not hmac.compare_digest(provided, token):
+                raise web.HTTPUnauthorized(text="Invalid audio token")
+
+        filename = Path(str(request.match_info.get("filename", ""))).name
+        if not filename:
+            raise web.HTTPNotFound(text="Missing audio filename")
+
+        allowed_dirs = [
+            Path.home() / ".hermes" / "voice_cache",
+            Path.home() / ".hermes" / "audio_cache",
+        ]
+        audio_path = next(
+            ((directory / filename) for directory in allowed_dirs if (directory / filename).is_file()),
+            None,
+        )
+        if audio_path is None:
+            raise web.HTTPNotFound(text="Audio file not found")
+
+        response = web.FileResponse(path=audio_path)
+        guessed_type, _ = mimetypes.guess_type(str(audio_path))
+        if guessed_type:
+            response.content_type = guessed_type
+        return response
 
     async def _handle_ws(self, request: "aiohttp_web.Request") -> "aiohttp_web.WebSocketResponse":
         assert web is not None
@@ -317,7 +524,12 @@ class HermesHAWebSocketServer:
                         payload = json.loads(msg.data)
                         if not isinstance(payload, dict):
                             raise ValueError("payload must be a JSON object")
-                        response = handle_ha_ws_payload(payload)
+                        msg_type = str(payload.get("type", "")).strip().lower()
+                        if msg_type == "assist_query":
+                            _record_message(msg_type)
+                            response = await handle_assist_query_async(payload)
+                        else:
+                            response = handle_ha_ws_payload(payload)
                     except Exception as exc:
                         response = {"type": "error", "ok": False, "error": str(exc)}
                     await ws.send_json(response)

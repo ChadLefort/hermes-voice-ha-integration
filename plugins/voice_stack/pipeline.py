@@ -149,7 +149,11 @@ def play_audio_ha(audio_path: str, media_player_entity: str) -> bool:
         return False
 
     # Determine the audio URL (serve from Hermes HTTP server)
-    audio_url = f"file://{audio_path}"
+    try:
+        from .ws_receiver import build_audio_stream_url
+        audio_url = build_audio_stream_url(audio_path)
+    except Exception:
+        audio_url = f"file://{audio_path}"
 
     result = call_service(
         "media_player",
@@ -303,10 +307,11 @@ class VoicePipeline:
 
     @property
     def available(self) -> bool:
-        """Return True if at minimum TTS and STT engines are available."""
+        """Return True if TTS, STT, and wake-word engines are available."""
         tts_ok = self._tts is not None and self._tts.available()
         stt_ok = self._stt is not None and self._stt.available()
-        return tts_ok and stt_ok
+        wake_ok = self._wake_word is not None and self._wake_word.available()
+        return tts_ok and stt_ok and wake_ok
 
     def start(self) -> bool:
         """Start the voice pipeline in a background thread."""
@@ -340,12 +345,36 @@ class VoicePipeline:
             try:
                 self._state.listening = True
 
-                # 1. Wait for wake word
-                if self._wake_word:
+                if self._wake_word is None:
+                    logger.error("Voice pipeline cannot run without a wake-word engine; disabling continuous mode")
+                    self._state.enabled = False
+                    break
+
+                try:
+                    if not self._wake_word.available():
+                        logger.error("Wake-word engine is unavailable; disabling continuous voice mode")
+                        self._state.enabled = False
+                        break
                     detected = self._wake_word.listen(timeout_seconds=5.0)
-                    if not detected:
-                        continue
-                    self._state.wake_word_detected = True
+                except (ImportError, ModuleNotFoundError) as exc:
+                    logger.error(
+                        "Wake-word dependencies are missing (%s); disabling continuous voice mode without affecting the HA bridge",
+                        exc,
+                    )
+                    self._state.enabled = False
+                    break
+                except Exception as exc:
+                    logger.error(
+                        "Wake-word engine failed (%s); disabling continuous voice mode without affecting the HA bridge",
+                        exc,
+                        exc_info=True,
+                    )
+                    self._state.enabled = False
+                    break
+
+                if not detected:
+                    continue
+                self._state.wake_word_detected = True
 
                 # 2. Record audio
                 cache_dir = Path.home() / ".hermes" / "voice_cache"

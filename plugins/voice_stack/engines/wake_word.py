@@ -1,20 +1,30 @@
 """Wake Word Engine — keyword spotting.
 
 Concrete engines:
-- PorcupineEngine: Picovoice Porcupine (commercial, most accurate)
-- OpenWakeWordEngine: OpenWakeWord (open source, good accuracy)
-- CommandWWEngine: Generic CLI wake word (for custom engines)
+- PorcupineEngine: Picovoice Porcupine
+- OpenWakeWordEngine: OpenWakeWord
+- CommandWWEngine: Generic CLI wake-word wrapper
+- DisabledWakeWordEngine: explicit no-op / unavailable state
+
+Design goals:
+- Imports stay lazy so missing optional dependencies do not crash Hermes.
+- A broken wake-word backend should disable only the local voice loop, not the
+  Home Assistant websocket bridge or the rest of the gateway.
+- External detectors such as MiroWakeWord can integrate through the generic
+  command wrapper.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import queue
+import shlex
 import shutil
 import subprocess
+import time
 from abc import ABC, abstractmethod
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -29,9 +39,7 @@ class WakeWordEngine(ABC):
 
     @abstractmethod
     def listen(self, timeout_seconds: float = 60.0) -> bool:
-        """Block until the wake word is detected or timeout.
-        Returns True if wake word was detected.
-        """
+        """Block until the wake word is detected or timeout."""
         ...
 
     @abstractmethod
@@ -40,22 +48,80 @@ class WakeWordEngine(ABC):
         ...
 
     def list_wake_words(self) -> List[str]:
-        """Return available wake word models."""
         return []
 
 
-# ---------------------------------------------------------------------------
-# Porcupine (Picovoice — most accurate, requires API key)
-# ---------------------------------------------------------------------------
+class DisabledWakeWordEngine(WakeWordEngine):
+    """No-op engine used when wake-word support is intentionally disabled."""
+
+    def __init__(self, reason: str = "disabled") -> None:
+        self.reason = reason
+
+    def available(self) -> bool:
+        return False
+
+    def listen(self, timeout_seconds: float = 60.0) -> bool:
+        time.sleep(min(timeout_seconds, 0.25))
+        return False
+
+    def stop(self) -> None:
+        return None
+
+
+class _RawMicStream:
+    """Small sounddevice wrapper that yields raw int16 PCM frames."""
+
+    def __init__(self, sample_rate: int, blocksize: int) -> None:
+        self.sample_rate = sample_rate
+        self.blocksize = blocksize
+        self._queue: "queue.Queue[bytes]" = queue.Queue()
+        self._stream = None
+        self._closed = False
+
+    def __enter__(self) -> "_RawMicStream":
+        import sounddevice as sd
+
+        def _callback(indata, frames, time_info, status) -> None:
+            if status:
+                logger.debug("Wake-word audio status: %s", status)
+            if not self._closed:
+                self._queue.put(bytes(indata))
+
+        self._stream = sd.RawInputStream(
+            samplerate=self.sample_rate,
+            blocksize=self.blocksize,
+            channels=1,
+            dtype="int16",
+            callback=_callback,
+        )
+        self._stream.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._closed = True
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+            except Exception:
+                pass
+            try:
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+
+    def read(self, timeout: float = 1.0) -> Optional[bytes]:
+        try:
+            return self._queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
 
 class PorcupineEngine(WakeWordEngine):
     """Porcupine wake word engine via pvporcupine.
 
-    Install: pip install pvporcupine
-    Free API key from: https://console.picovoice.ai/
-
-    Built-in wake words: "computer", "jarvis", "alexa", "hey google", "hey siri", "ok google", "porcupine", "terminator"
-    Custom wake words: Train at https://console.picovoice.ai/
+    Uses sounddevice for microphone capture so a missing PyAudio install does
+    not sink the whole feature.
     """
 
     def __init__(
@@ -64,26 +130,25 @@ class PorcupineEngine(WakeWordEngine):
         keywords: Optional[List[str]] = None,
         sensitivities: Optional[List[float]] = None,
     ) -> None:
-        self._access_key = access_key or os.getenv("PORCUPINE_ACCESS_KEY", "")
+        self._access_key = access_key or os.getenv("PORCUPINE_ACCESS_KEY", "").strip()
         self._keywords = keywords or ["computer"]
         self._sensitivities = sensitivities or [0.5] * len(self._keywords)
         self._porcupine = None
-        self._audio_stream = None
         self._stop = False
 
     def available(self) -> bool:
+        if not self._access_key:
+            return False
         try:
             import pvporcupine  # noqa: F401
-            import pyaudio  # noqa: F401
+            import sounddevice  # noqa: F401
             return True
         except ImportError:
             return False
 
     def listen(self, timeout_seconds: float = 60.0) -> bool:
         import pvporcupine
-        import pyaudio
         import struct
-        import time
 
         if not self._access_key:
             raise RuntimeError("PORCUPINE_ACCESS_KEY not set")
@@ -93,31 +158,26 @@ class PorcupineEngine(WakeWordEngine):
             keywords=self._keywords,
             sensitivities=self._sensitivities,
         )
-        self._audio = pyaudio.PyAudio()
         self._stop = False
 
         try:
-            self._audio_stream = self._audio.open(
-                rate=self._porcupine.sample_rate,
-                channels=1,
-                format=pyaudio.paInt16,
-                input=True,
-                frames_per_buffer=self._porcupine.frame_length,
-            )
-
-            start = time.monotonic()
-            while not self._stop:
-                if time.monotonic() - start > timeout_seconds:
-                    return False
-
-                pcm = self._audio_stream.read(self._porcupine.frame_length, exception_on_overflow=False)
-                pcm = struct.unpack_from("h" * self._porcupine.frame_length, pcm)
-                keyword_index = self._porcupine.process(pcm)
-                if keyword_index >= 0:
-                    logger.info("Wake word detected: %s", self._keywords[keyword_index])
-                    return True
-
-            return False
+            with _RawMicStream(
+                sample_rate=self._porcupine.sample_rate,
+                blocksize=self._porcupine.frame_length,
+            ) as mic:
+                start = time.monotonic()
+                while not self._stop:
+                    if time.monotonic() - start > timeout_seconds:
+                        return False
+                    chunk = mic.read(timeout=1.0)
+                    if chunk is None:
+                        continue
+                    pcm = struct.unpack_from("h" * self._porcupine.frame_length, chunk)
+                    keyword_index = self._porcupine.process(pcm)
+                    if keyword_index >= 0:
+                        logger.info("Wake word detected: %s", self._keywords[keyword_index])
+                        return True
+                return False
         finally:
             self._cleanup()
 
@@ -125,19 +185,7 @@ class PorcupineEngine(WakeWordEngine):
         self._stop = True
 
     def _cleanup(self) -> None:
-        if self._audio_stream:
-            try:
-                self._audio_stream.stop_stream()
-                self._audio_stream.close()
-            except Exception:
-                pass
-            self._audio_stream = None
-        if self._audio:
-            try:
-                self._audio.terminate()
-            except Exception:
-                pass
-        if self._porcupine:
+        if self._porcupine is not None:
             try:
                 self._porcupine.delete()
             except Exception:
@@ -153,116 +201,85 @@ class PorcupineEngine(WakeWordEngine):
         ]
 
 
-# ---------------------------------------------------------------------------
-# OpenWakeWord (open-source, onnxruntime-based)
-# ---------------------------------------------------------------------------
-
 class OpenWakeWordEngine(WakeWordEngine):
-    """OpenWakeWord engine.
+    """OpenWakeWord engine backed by sounddevice + numpy."""
 
-    Install: pip install openwakeword
-    Pre-trained models: https://github.com/fwartner/openwakeword-models
-
-    This engine uses a simpler polling-based approach that checks audio
-    chunks for wake word activation.
-    """
-
-    def __init__(self, model_paths: Optional[List[str]] = None) -> None:
-        self._model_paths = model_paths or []
+    def __init__(
+        self,
+        model_paths: Optional[List[str]] = None,
+        wake_words: Optional[List[str]] = None,
+        threshold: float = 0.5,
+    ) -> None:
+        self._model_paths = [p for p in (model_paths or []) if p]
+        self._wake_words = [w for w in (wake_words or []) if w]
+        self._threshold = threshold
         self._models: List[Any] = []
-        self._audio_stream = None
         self._stop = False
 
     def available(self) -> bool:
         try:
             import openwakeword  # noqa: F401
             import numpy  # noqa: F401
-            import pyaudio  # noqa: F401
+            import sounddevice  # noqa: F401
             return True
         except ImportError:
             return False
 
     def listen(self, timeout_seconds: float = 60.0) -> bool:
-        import pyaudio
         import numpy as np
-        import time
         from openwakeword.model import Model
 
-        if not self._model_paths:
-            # Use built-in pre-trained models that ship with openwakeword
-            self._models = [Model(wakeword_models=["alexa"])]
+        model_kwargs: dict[str, Any] = {}
+        if self._model_paths:
+            model_kwargs["wakeword_models"] = self._model_paths
+        elif self._wake_words:
+            model_kwargs["wakeword_models"] = self._wake_words
         else:
-            self._models = [Model(wakeword_models=p) for p in self._model_paths]
+            model_kwargs["wakeword_models"] = ["alexa"]
 
-        self._audio = pyaudio.PyAudio()
+        self._models = [Model(**model_kwargs)]
         self._stop = False
-        chunk_rate = 16000
+        sample_rate = 16000
+        blocksize = 1280  # 80ms at 16kHz
 
-        try:
-            self._audio_stream = self._audio.open(
-                rate=chunk_rate,
-                channels=1,
-                format=pyaudio.paInt16,
-                input=True,
-                frames_per_buffer=1280,  # 80ms chunks at 16kHz
-            )
-
+        with _RawMicStream(sample_rate=sample_rate, blocksize=blocksize) as mic:
             start = time.monotonic()
             while not self._stop:
                 if time.monotonic() - start > timeout_seconds:
                     return False
-
-                pcm = np.frombuffer(self._audio_stream.read(1280, exception_on_overflow=False), dtype=np.int16)
-
+                chunk = mic.read(timeout=1.0)
+                if chunk is None:
+                    continue
+                pcm = np.frombuffer(chunk, dtype=np.int16)
                 for model in self._models:
                     predictions = model.predict(pcm)
                     for wake_word, score in predictions.items():
-                        if score > 0.5:
+                        if score >= self._threshold:
                             logger.info("Wake word '%s' detected (score: %.2f)", wake_word, score)
                             return True
-
             return False
-        finally:
-            self._cleanup()
 
     def stop(self) -> None:
         self._stop = True
 
-    def _cleanup(self) -> None:
-        if self._audio_stream:
-            try:
-                self._audio_stream.stop_stream()
-                self._audio_stream.close()
-            except Exception:
-                pass
-            self._audio_stream = None
-        if hasattr(self, "_audio") and self._audio:
-            try:
-                self._audio.terminate()
-            except Exception:
-                pass
-
-
-# ---------------------------------------------------------------------------
-# Command Wake Word (generic CLI wrapper)
-# ---------------------------------------------------------------------------
 
 class CommandWWEngine(WakeWordEngine):
     """Generic CLI-based wake word engine.
 
-    Config: wake_word.command = ["my-wake-detector", "--timeout", "{timeout}"]
-    The {timeout} placeholder is substituted at runtime. The command should
-    exit 0 when the wake word is detected, non-zero on timeout or error.
+    The command should exit 0 when the wake word is detected, non-zero on
+    timeout or error. `{timeout}` placeholders are expanded at runtime.
     """
 
-    def __init__(self, command: list[str]) -> None:
+    def __init__(self, command: List[str]) -> None:
         self._command = command
         self._proc = None
 
     def available(self) -> bool:
-        return shutil.which(self._command[0]) is not None if self._command else False
+        return bool(self._command) and shutil.which(self._command[0]) is not None
 
     def listen(self, timeout_seconds: float = 60.0) -> bool:
+        if not self.available():
+            raise RuntimeError("Wake-word command not available")
         cmd = [part.replace("{timeout}", str(int(timeout_seconds))) for part in self._command]
         self._proc = subprocess.Popen(cmd)
         try:
@@ -281,26 +298,113 @@ class CommandWWEngine(WakeWordEngine):
                 pass
 
 
-# ---------------------------------------------------------------------------
-# Factory
-# ---------------------------------------------------------------------------
+def _normalize_engine_name(engine_type: str) -> str:
+    return str(engine_type or "").strip().lower().replace("-", "").replace("_", "")
 
-def create_wake_word_engine(engine_type: str = "porcupine", **kwargs: Any) -> WakeWordEngine:
+
+def _parse_command(value: Any) -> List[str]:
+    if isinstance(value, (list, tuple)):
+        return [str(part) for part in value if str(part).strip()]
+    if isinstance(value, str) and value.strip():
+        return shlex.split(value)
+    return []
+
+
+def _configured_command(command: Any = None) -> List[str]:
+    parsed = _parse_command(command)
+    if parsed:
+        return parsed
+    for env_name in ("HERMES_WAKE_WORD_COMMAND", "HERMES_MIROWAKEWORD_COMMAND"):
+        env_value = os.getenv(env_name, "").strip()
+        if env_value:
+            parsed = _parse_command(env_value)
+            if parsed:
+                return parsed
+    return []
+
+
+def _pick_auto_engine(
+    access_key: Optional[str],
+    keywords: Optional[List[str]],
+    sensitivities: Optional[List[float]],
+    model_paths: Optional[List[str]],
+    wake_words: Optional[List[str]],
+    threshold: float,
+    command: Any,
+) -> WakeWordEngine:
+    porcupine = PorcupineEngine(
+        access_key=access_key,
+        keywords=keywords,
+        sensitivities=sensitivities,
+    )
+    if porcupine.available():
+        return porcupine
+
+    open_wake_word = OpenWakeWordEngine(
+        model_paths=model_paths,
+        wake_words=wake_words,
+        threshold=threshold,
+    )
+    if open_wake_word.available():
+        return open_wake_word
+
+    cmd = _configured_command(command)
+    if cmd:
+        command_engine = CommandWWEngine(cmd)
+        if command_engine.available():
+            return command_engine
+
+    return DisabledWakeWordEngine("No wake-word backend available")
+
+
+def create_wake_word_engine(engine_type: str = "auto", **kwargs: Any) -> WakeWordEngine:
     """Create a wake word engine instance by name.
 
-    Args:
-        engine_type: "porcupine", "openwakeword", or "command"
-        **kwargs: Passed to engine constructor
+    Supported names:
+    - auto
+    - porcupine
+    - openwakeword
+    - mirowakeword (alias for command-based external detector)
+    - command
+    - disabled/off/none
     """
-    if engine_type == "porcupine":
-        return PorcupineEngine(
-            access_key=kwargs.get("access_key"),
-            keywords=kwargs.get("keywords", ["computer"]),
-            sensitivities=kwargs.get("sensitivities"),
+    normalized = _normalize_engine_name(engine_type)
+    keywords = kwargs.get("keywords") or ["computer"]
+    sensitivities = kwargs.get("sensitivities")
+    access_key = kwargs.get("access_key")
+    model_paths = kwargs.get("model_paths")
+    wake_words = kwargs.get("wake_words") or keywords
+    threshold = float(kwargs.get("threshold", 0.5))
+    command = kwargs.get("command")
+
+    if normalized in {"", "auto"}:
+        return _pick_auto_engine(
+            access_key=access_key,
+            keywords=keywords,
+            sensitivities=sensitivities,
+            model_paths=model_paths,
+            wake_words=wake_words,
+            threshold=threshold,
+            command=command,
         )
-    elif engine_type == "openwakeword":
-        return OpenWakeWordEngine(model_paths=kwargs.get("model_paths"))
-    elif engine_type == "command":
-        return CommandWWEngine(command=kwargs.get("command", ["false"]))
-    else:
-        raise ValueError(f"Unknown wake word engine '{engine_type}'. Valid: porcupine, openwakeword, command")
+    if normalized in {"disabled", "disable", "off", "none", "false"}:
+        return DisabledWakeWordEngine("Wake-word engine disabled by config")
+    if normalized == "porcupine":
+        return PorcupineEngine(
+            access_key=access_key,
+            keywords=keywords,
+            sensitivities=sensitivities,
+        )
+    if normalized == "openwakeword":
+        return OpenWakeWordEngine(
+            model_paths=model_paths,
+            wake_words=wake_words,
+            threshold=threshold,
+        )
+    if normalized == "mirowakeword":
+        return CommandWWEngine(_configured_command(command))
+    if normalized == "command":
+        return CommandWWEngine(_configured_command(command))
+    raise ValueError(
+        f"Unknown wake word engine '{engine_type}'. Valid: auto, porcupine, openwakeword, mirowakeword, command, disabled"
+    )
