@@ -45,6 +45,7 @@ _VOICE_ACTION_RESERVED_KEYS = {"type", "action", "args"}
 _ASSIST_HISTORY_LOCK = threading.Lock()
 _ASSIST_HISTORY: dict[str, list[dict[str, Any]]] = {}
 _AUDIO_ROUTE_PATH = "/api/hermes/audio/{filename}"
+_ASSIST_AUX_TASK_KEY = "voice_stack_assist"
 
 
 def _record_message(msg_type: str) -> None:
@@ -140,6 +141,56 @@ def _build_assist_system_prompt() -> str:
     return build_voice_system_prompt(areas=None, entities=entities)
 
 
+def _assist_auxiliary_configured(cfg: dict[str, Any]) -> bool:
+    """Return True when the user explicitly configured the Assist aux task."""
+    auxiliary = cfg.get("auxiliary", {}) if isinstance(cfg, dict) else {}
+    task_cfg = auxiliary.get(_ASSIST_AUX_TASK_KEY, {}) if isinstance(auxiliary, dict) else {}
+    if not isinstance(task_cfg, dict):
+        return False
+    return any(
+        key in task_cfg
+        for key in ("provider", "model", "base_url", "api_key", "api_mode")
+    )
+
+
+def _resolve_assist_runtime(cfg: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """Resolve runtime + model for HA Assist.
+
+    Default behavior preserves the existing main-model routing. When the user
+    explicitly configures ``auxiliary.voice_stack_assist`` in Hermes config,
+    Assist queries switch to that auxiliary provider/model instead.
+    """
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+    effective_model = ""
+    effective_provider = None
+    if isinstance(model_cfg, dict):
+        effective_model = str(model_cfg.get("default") or model_cfg.get("model") or "").strip()
+        raw_provider = str(model_cfg.get("provider") or "").strip().lower()
+        effective_provider = raw_provider or None
+
+    if not _assist_auxiliary_configured(cfg):
+        runtime = resolve_runtime_provider(
+            requested=effective_provider,
+            target_model=effective_model or None,
+        )
+        return runtime, effective_model
+
+    from agent.auxiliary_client import _resolve_task_provider_model
+
+    requested, resolved_model, resolved_base_url, resolved_api_key, _resolved_api_mode = _resolve_task_provider_model(
+        _ASSIST_AUX_TASK_KEY
+    )
+    runtime = resolve_runtime_provider(
+        requested=requested,
+        explicit_base_url=resolved_base_url,
+        explicit_api_key=resolved_api_key,
+        target_model=resolved_model or effective_model or None,
+    )
+    return runtime, str(resolved_model or effective_model or "").strip()
+
+
 def run_local_assist_query(
     text: str,
     *,
@@ -162,23 +213,11 @@ def run_local_assist_query(
 
     from hermes_cli.config import load_config
     from hermes_cli.fallback_config import get_fallback_chain
-    from hermes_cli.runtime_provider import resolve_runtime_provider
     from hermes_cli.tools_config import _get_platform_tools
     from run_agent import AIAgent
 
     cfg = load_config()
-    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
-    effective_model = ""
-    effective_provider = None
-    if isinstance(model_cfg, dict):
-        effective_model = str(model_cfg.get("default") or model_cfg.get("model") or "").strip()
-        raw_provider = str(model_cfg.get("provider") or "").strip().lower()
-        effective_provider = raw_provider or None
-
-    runtime = resolve_runtime_provider(
-        requested=effective_provider,
-        target_model=effective_model or None,
-    )
+    runtime, effective_model = _resolve_assist_runtime(cfg)
 
     toolsets = set(_get_platform_tools(cfg, "cli"))
     toolsets.add("homeassistant")

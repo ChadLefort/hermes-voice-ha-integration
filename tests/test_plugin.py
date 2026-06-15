@@ -828,6 +828,26 @@ class TestVoicePluginInit:
         assert "HERMES_HA_WS_TOKEN" in data["config"]
         assert data["version"] == "0.0.10"
 
+    def test_register_exposes_voice_stack_assist_auxiliary_task(self):
+        import plugins.voice_stack as voice_stack
+
+        recorded = {}
+
+        class FakeCtx:
+            def register_tool(self, **kwargs):
+                return None
+
+            def register_auxiliary_task(self, **kwargs):
+                recorded.update(kwargs)
+
+        with patch("plugins.voice_stack._init_engines", return_value=True), patch(
+            "plugins.voice_stack.ws_receiver.start_ws_receiver", return_value=None
+        ):
+            voice_stack.register(FakeCtx())
+
+        assert recorded["key"] == "voice_stack_assist"
+        assert recorded["display_name"] == "Voice Stack Assist"
+        assert recorded["defaults"]["provider"] == "auto"
 
 
 class TestVoiceWebSocketReceiver:
@@ -923,6 +943,72 @@ class TestVoiceWebSocketReceiver:
         assert _auth_ok({}) is False
         assert _auth_ok({"Authorization": "Bearer secret"}) is True
         assert _auth_ok({"Authorization": "Bearer wrong"}) is False
+
+    def test_assist_runtime_defaults_to_main_model_when_aux_not_configured(self, monkeypatch):
+        import sys
+        import types
+
+        from plugins.voice_stack.ws_receiver import _resolve_assist_runtime
+
+        seen = {}
+
+        def fake_resolve_runtime_provider(**kwargs):
+            seen.update(kwargs)
+            return {"provider": "openai-codex", "api_key": "k"}
+
+        hermes_cli_pkg = types.ModuleType("hermes_cli")
+        runtime_provider_mod = types.ModuleType("hermes_cli.runtime_provider")
+        runtime_provider_mod.resolve_runtime_provider = fake_resolve_runtime_provider
+        monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli_pkg)
+        monkeypatch.setitem(sys.modules, "hermes_cli.runtime_provider", runtime_provider_mod)
+
+        runtime, model = _resolve_assist_runtime(
+            {"model": {"default": "gpt-5.4", "provider": "openai-codex"}}
+        )
+
+        assert runtime["provider"] == "openai-codex"
+        assert model == "gpt-5.4"
+        assert seen["requested"] == "openai-codex"
+        assert seen["target_model"] == "gpt-5.4"
+
+    def test_assist_runtime_uses_auxiliary_slot_when_configured(self, monkeypatch):
+        import sys
+        import types
+
+        from plugins.voice_stack.ws_receiver import _resolve_assist_runtime
+
+        seen = {}
+
+        def fake_aux_resolve(task):
+            assert task == "voice_stack_assist"
+            return ("openai-codex", "gpt-5.4-mini", "", None, None)
+
+        def fake_resolve_runtime_provider(**kwargs):
+            seen.update(kwargs)
+            return {"provider": "openai-codex", "api_key": "k"}
+
+        hermes_cli_pkg = types.ModuleType("hermes_cli")
+        runtime_provider_mod = types.ModuleType("hermes_cli.runtime_provider")
+        runtime_provider_mod.resolve_runtime_provider = fake_resolve_runtime_provider
+        agent_pkg = types.ModuleType("agent")
+        auxiliary_client_mod = types.ModuleType("agent.auxiliary_client")
+        auxiliary_client_mod._resolve_task_provider_model = fake_aux_resolve
+        monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli_pkg)
+        monkeypatch.setitem(sys.modules, "hermes_cli.runtime_provider", runtime_provider_mod)
+        monkeypatch.setitem(sys.modules, "agent", agent_pkg)
+        monkeypatch.setitem(sys.modules, "agent.auxiliary_client", auxiliary_client_mod)
+
+        runtime, model = _resolve_assist_runtime(
+            {
+                "model": {"default": "gpt-5.4", "provider": "openai-codex"},
+                "auxiliary": {"voice_stack_assist": {"provider": "openai-codex", "model": "gpt-5.4-mini"}},
+            }
+        )
+
+        assert runtime["provider"] == "openai-codex"
+        assert model == "gpt-5.4-mini"
+        assert seen["requested"] == "openai-codex"
+        assert seen["target_model"] == "gpt-5.4-mini"
 
 
 class TestHermesServices:
