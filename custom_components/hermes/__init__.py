@@ -25,7 +25,7 @@ from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.typing import ConfigType
 
-from .const import DOMAIN, CONF_ENTITY_FILTER, DEFAULT_ENTITY_FILTER, CONF_VERIFY_SSL, DEFAULT_VERIFY_SSL, CONF_TTS_ENGINE, DEFAULT_TTS_ENGINE, CONF_TTS_VOICE, DEFAULT_TTS_VOICE, CONF_STT_ENGINE, DEFAULT_STT_ENGINE, CONF_STT_MODEL, DEFAULT_STT_MODEL, CONF_WAKE_WORD_ENGINE, DEFAULT_WAKE_WORD_ENGINE, CONF_WAKE_WORD, DEFAULT_WAKE_WORD, CONF_MEDIA_PLAYER, DEFAULT_MEDIA_PLAYER, normalize_list, normalize_wake_word, WS_TYPE_ASSIST_QUERY, WS_TYPE_ASSIST_RESPONSE, WS_TYPE_HERMES_EVENT, WS_TYPE_STATE_ACK, WS_TYPE_STATE_CHANGED
+from .const import DOMAIN, CONF_ENTITY_FILTER, DEFAULT_ENTITY_FILTER, CONF_VERIFY_SSL, DEFAULT_VERIFY_SSL, CONF_TTS_ENGINE, DEFAULT_TTS_ENGINE, CONF_TTS_VOICE, DEFAULT_TTS_VOICE, CONF_STT_ENGINE, DEFAULT_STT_ENGINE, CONF_STT_MODEL, DEFAULT_STT_MODEL, CONF_WAKE_WORD_ENGINE, DEFAULT_WAKE_WORD_ENGINE, CONF_WAKE_WORD, DEFAULT_WAKE_WORD, CONF_MEDIA_PLAYER, DEFAULT_MEDIA_PLAYER, normalize_list, normalize_wake_word, WS_TYPE_ASSIST_QUERY, WS_TYPE_ASSIST_RESPONSE, WS_TYPE_HERMES_EVENT, WS_TYPE_STATE_ACK, WS_TYPE_STATE_CHANGED, ASSIST_QUERY_TIMEOUT_SECONDS
 from .frontend import async_register_resources as _register_frontend
 
 _LOGGER = logging.getLogger(__name__)
@@ -411,11 +411,13 @@ class HermesBridge:
             raise ConnectionError("Hermes WebSocket not connected")
 
         try:
-            result = await asyncio.wait_for(future, timeout=30.0)
+            result = await asyncio.wait_for(future, timeout=ASSIST_QUERY_TIMEOUT_SECONDS)
             return result
         except asyncio.TimeoutError:
             self._pending_queries.pop(conversation_id, None)
-            raise TimeoutError("Hermes did not respond within 30 seconds")
+            raise TimeoutError(
+                f"Glados did not respond within {int(ASSIST_QUERY_TIMEOUT_SECONDS)} seconds"
+            )
 
     async def async_shutdown(self) -> None:
         """Clean up connections."""

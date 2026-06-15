@@ -828,28 +828,6 @@ class TestVoicePluginInit:
         assert "HERMES_HA_WS_TOKEN" in data["config"]
         assert data["version"] == "0.0.11"
 
-    def test_register_exposes_voice_stack_assist_auxiliary_task(self):
-        import plugins.voice_stack as voice_stack
-
-        recorded = {}
-
-        class FakeCtx:
-            def register_tool(self, **kwargs):
-                return None
-
-            def register_auxiliary_task(self, **kwargs):
-                recorded.update(kwargs)
-
-        with patch("plugins.voice_stack._init_engines", return_value=True), patch(
-            "plugins.voice_stack.ws_receiver.start_ws_receiver", return_value=None
-        ):
-            voice_stack.register(FakeCtx())
-
-        assert recorded["key"] == "voice_stack_assist"
-        assert recorded["display_name"] == "Voice Stack Assist"
-        assert recorded["defaults"]["provider"] == "auto"
-
-
 class TestVoiceWebSocketReceiver:
     """HA-facing /api/hermes/ws receiver tests."""
 
@@ -944,7 +922,7 @@ class TestVoiceWebSocketReceiver:
         assert _auth_ok({"Authorization": "Bearer secret"}) is True
         assert _auth_ok({"Authorization": "Bearer wrong"}) is False
 
-    def test_assist_runtime_defaults_to_main_model_when_aux_not_configured(self, monkeypatch):
+    def test_assist_runtime_uses_profile_main_model(self, monkeypatch):
         import sys
         import types
 
@@ -971,44 +949,120 @@ class TestVoiceWebSocketReceiver:
         assert seen["requested"] == "openai-codex"
         assert seen["target_model"] == "gpt-5.4"
 
-    def test_assist_runtime_uses_auxiliary_slot_when_configured(self, monkeypatch):
+
+class TestWarmAssistAgent:
+    """Warm Assist agent pool reuses profile-configured agents across queries."""
+
+    def setup_method(self) -> None:
+        from plugins.voice_stack.ws_receiver import reset_warm_assist_agent
+
+        reset_warm_assist_agent()
+
+    def teardown_method(self) -> None:
+        from plugins.voice_stack.ws_receiver import reset_warm_assist_agent
+
+        reset_warm_assist_agent()
+
+    def test_assist_toolsets_uses_profile_cli_toolsets(self, monkeypatch):
         import sys
         import types
 
-        from plugins.voice_stack.ws_receiver import _resolve_assist_runtime
+        from plugins.voice_stack.ws_receiver import _assist_toolsets
 
-        seen = {}
-
-        def fake_aux_resolve(task):
-            assert task == "voice_stack_assist"
-            return ("openai-codex", "gpt-5.4-mini", "", None, None)
-
-        def fake_resolve_runtime_provider(**kwargs):
-            seen.update(kwargs)
-            return {"provider": "openai-codex", "api_key": "k"}
-
-        hermes_cli_pkg = types.ModuleType("hermes_cli")
-        runtime_provider_mod = types.ModuleType("hermes_cli.runtime_provider")
-        runtime_provider_mod.resolve_runtime_provider = fake_resolve_runtime_provider
-        agent_pkg = types.ModuleType("agent")
-        auxiliary_client_mod = types.ModuleType("agent.auxiliary_client")
-        auxiliary_client_mod._resolve_task_provider_model = fake_aux_resolve
-        monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli_pkg)
-        monkeypatch.setitem(sys.modules, "hermes_cli.runtime_provider", runtime_provider_mod)
-        monkeypatch.setitem(sys.modules, "agent", agent_pkg)
-        monkeypatch.setitem(sys.modules, "agent.auxiliary_client", auxiliary_client_mod)
-
-        runtime, model = _resolve_assist_runtime(
-            {
-                "model": {"default": "gpt-5.4", "provider": "openai-codex"},
-                "auxiliary": {"voice_stack_assist": {"provider": "openai-codex", "model": "gpt-5.4-mini"}},
-            }
+        tools_config_mod = types.ModuleType("hermes_cli.tools_config")
+        tools_config_mod._get_platform_tools = (
+            lambda cfg, platform: ["homeassistant", "tts"] if platform == "cli" else []
         )
+        hermes_cli_pkg = sys.modules.get("hermes_cli") or types.ModuleType("hermes_cli")
+        monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli_pkg)
+        monkeypatch.setitem(sys.modules, "hermes_cli.tools_config", tools_config_mod)
 
-        assert runtime["provider"] == "openai-codex"
-        assert model == "gpt-5.4-mini"
-        assert seen["requested"] == "openai-codex"
-        assert seen["target_model"] == "gpt-5.4-mini"
+        assert _assist_toolsets({}) == ["homeassistant", "tts"]
+
+    def test_get_warm_assist_agent_reuses_same_instance(self, monkeypatch):
+        from plugins.voice_stack import ws_receiver
+
+        created: list[object] = []
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.closed = False
+                created.append(self)
+
+            def close(self):
+                self.closed = True
+
+        cfg = {
+            "model": {"default": "gpt-5.4-mini", "provider": "openai-codex"},
+            "platform_toolsets": {"cli": ["homeassistant"]},
+            "agent": {"max_turns": 12},
+        }
+
+        monkeypatch.setattr(ws_receiver, "_resolve_assist_runtime", lambda c: ({"provider": "openai-codex"}, "gpt-5.4-mini"))
+        monkeypatch.setattr(ws_receiver, "_assist_toolsets", lambda c: ["homeassistant"])
+        monkeypatch.setattr(ws_receiver, "_assist_agent_signature", lambda *a, **k: ("sig",))
+        monkeypatch.setattr(ws_receiver, "_build_assist_agent", lambda *a, **k: FakeAgent())
+        monkeypatch.setattr(ws_receiver, "_build_assist_system_prompt", lambda: "assist prompt")
+
+        first = ws_receiver._get_warm_assist_agent(cfg)
+        second = ws_receiver._get_warm_assist_agent(cfg)
+
+        assert first is second
+        assert len(created) == 1
+
+    def test_get_warm_assist_agent_rebuilds_when_signature_changes(self, monkeypatch):
+        from plugins.voice_stack import ws_receiver
+
+        created: list[object] = []
+        signatures = iter(["sig-a", "sig-b"])
+
+        class FakeAgent:
+            def __init__(self):
+                self.closed = False
+                created.append(self)
+
+            def close(self):
+                self.closed = True
+
+        cfg = {"model": {"default": "gpt-5.4-mini"}}
+
+        monkeypatch.setattr(ws_receiver, "_resolve_assist_runtime", lambda c: ({"provider": "openai-codex"}, "gpt-5.4-mini"))
+        monkeypatch.setattr(ws_receiver, "_assist_toolsets", lambda c: ["homeassistant"])
+        monkeypatch.setattr(ws_receiver, "_assist_agent_signature", lambda *a, **k: (next(signatures),))
+        monkeypatch.setattr(ws_receiver, "_build_assist_agent", lambda *a, **k: FakeAgent())
+        monkeypatch.setattr(ws_receiver, "_build_assist_system_prompt", lambda: "assist prompt")
+
+        first = ws_receiver._get_warm_assist_agent(cfg)
+        second = ws_receiver._get_warm_assist_agent(cfg)
+
+        assert first is not second
+        assert len(created) == 2
+        assert first.closed is True
+
+    def test_reset_warm_assist_agent_closes_cached_agent(self, monkeypatch):
+        from plugins.voice_stack import ws_receiver
+
+        class FakeAgent:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        cfg = {"model": {"default": "gpt-5.4-mini"}}
+        monkeypatch.setattr(ws_receiver, "_resolve_assist_runtime", lambda c: ({"provider": "openai-codex"}, "gpt-5.4-mini"))
+        monkeypatch.setattr(ws_receiver, "_assist_toolsets", lambda c: ["homeassistant"])
+        monkeypatch.setattr(ws_receiver, "_assist_agent_signature", lambda *a, **k: ("sig",))
+        monkeypatch.setattr(ws_receiver, "_build_assist_agent", lambda *a, **k: FakeAgent())
+        monkeypatch.setattr(ws_receiver, "_build_assist_system_prompt", lambda: "assist prompt")
+
+        agent = ws_receiver._get_warm_assist_agent(cfg)
+        ws_receiver.reset_warm_assist_agent()
+
+        assert agent.closed is True
+        assert ws_receiver._ASSIST_AGENT is None
+        assert ws_receiver._ASSIST_AGENT_SIGNATURE is None
 
 
 class TestVoiceWebSocketReceiverHardening:
@@ -1086,12 +1140,17 @@ class TestVoiceWebSocketReceiverHardening:
         monkeypatch.setattr(ws_receiver, "_gateway_daemon_running", lambda: True)
         assert ws_receiver._should_bind_ws_receiver() is True
 
-    def test_should_bind_false_for_dashboard_when_gateway_running(self, monkeypatch):
+    def test_should_bind_false_when_ha_listener_already_active(self, monkeypatch):
         from plugins.voice_stack import ws_receiver
 
         monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
-        monkeypatch.delenv("HERMES_HA_WS_FORCE_BIND", raising=False)
-        monkeypatch.setattr(ws_receiver, "_gateway_daemon_running", lambda: True)
+        monkeypatch.setattr(ws_receiver, "is_gateway_running", lambda *a, **k: False, raising=False)
+        monkeypatch.setattr(ws_receiver, "_probe_existing_receiver", lambda *a, **k: True)
+        monkeypatch.setattr(
+            ws_receiver,
+            "_gateway_daemon_running",
+            lambda: ws_receiver._probe_existing_receiver("0.0.0.0", 7860),
+        )
         assert ws_receiver._should_bind_ws_receiver() is False
 
     def test_should_bind_true_when_no_gateway_running(self, monkeypatch):

@@ -33,6 +33,8 @@ DEFAULT_WAKE_WORD = "computer"
 DEFAULT_MEDIA_PLAYER = ""
 DEFAULT_QUERY_LIMIT = 50
 MAX_QUERY_TEXT_LENGTH = 4096
+ASSIST_QUERY_TIMEOUT_SECONDS = 60.0
+ASSIST_UNAVAILABLE_MESSAGE = "Sorry, Glados is not responding right now."
 
 # WebSocket message type constants
 WS_TYPE_ASSIST_QUERY = "assist_query"

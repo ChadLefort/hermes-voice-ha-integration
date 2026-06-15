@@ -27,7 +27,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, MAX_QUERY_TEXT_LENGTH
+from .const import DOMAIN, ASSIST_UNAVAILABLE_MESSAGE, MAX_QUERY_TEXT_LENGTH
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -124,7 +124,7 @@ class HermesConversationAgent(ConversationEntity):
             _LOGGER.warning("Hermes conversation query failed: %s", exc)
             return self._make_error_result(
                 language,
-                "Sorry, Hermes is not responding right now.",
+                ASSIST_UNAVAILABLE_MESSAGE,
                 conversation_id,
             )
         except Exception as exc:

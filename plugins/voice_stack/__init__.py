@@ -542,12 +542,6 @@ def register(ctx) -> None:
             handler=handler,
             emoji=emoji,
         )
-    ctx.register_auxiliary_task(
-        key="voice_stack_assist",
-        display_name="Voice Stack Assist",
-        description="Provider/model used for Home Assistant Assist queries handled by the voice stack plugin.",
-        defaults={"provider": "auto", "model": "", "timeout": 120},
-    )
     # Start the HA-facing WebSocket receiver used by the Home Assistant
     # custom integration at /api/hermes/ws. It is fire-and-forget: when the
     # port is already occupied or aiohttp is unavailable, the warning is logged

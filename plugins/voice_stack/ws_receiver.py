@@ -41,7 +41,7 @@ DEFAULT_WS_PORT = 7860
 DEFAULT_WS_PATH = "/api/hermes/ws"
 
 _WS_SERVER: Optional["HermesHAWebSocketServer | _AdoptedReceiver"] = None
-_WS_LOCK = threading.Lock()
+_WS_LOCK = threading.RLock()
 _WS_WATCHDOG: Optional[threading.Thread] = None
 _WS_WATCHDOG_STOP = threading.Event()
 _START_TIME = time.monotonic()
@@ -52,8 +52,11 @@ _COUNTER_LOCK = threading.Lock()
 _VOICE_ACTION_RESERVED_KEYS = {"type", "action", "args"}
 _ASSIST_HISTORY_LOCK = threading.Lock()
 _ASSIST_HISTORY: dict[str, list[dict[str, Any]]] = {}
+_ASSIST_AGENT_LOCK = threading.RLock()
+_ASSIST_AGENT: Optional[Any] = None
+_ASSIST_AGENT_SIGNATURE: Optional[tuple[Any, ...]] = None
+_ASSIST_SESSION_DB: Optional[Any] = None
 _AUDIO_ROUTE_PATH = "/api/hermes/audio/{filename}"
-_ASSIST_AUX_TASK_KEY = "voice_stack_assist"
 _ATEXIT_HOOK_REGISTERED = False
 
 
@@ -67,9 +70,13 @@ def _gateway_daemon_running() -> bool:
     try:
         from gateway.status import is_gateway_running
 
-        return bool(is_gateway_running())
+        if is_gateway_running():
+            return True
     except Exception:
-        return False
+        pass
+    # Fallback: another profile's gateway may already own :7860 even when this
+    # profile's gateway.pid is missing (common right after profile gateway install).
+    return _probe_existing_receiver(DEFAULT_WS_HOST, DEFAULT_WS_PORT)
 
 
 def _should_bind_ws_receiver() -> bool:
@@ -272,25 +279,8 @@ def _build_assist_system_prompt() -> str:
     return build_voice_system_prompt(areas=None, entities=entities)
 
 
-def _assist_auxiliary_configured(cfg: dict[str, Any]) -> bool:
-    """Return True when the user explicitly configured the Assist aux task."""
-    auxiliary = cfg.get("auxiliary", {}) if isinstance(cfg, dict) else {}
-    task_cfg = auxiliary.get(_ASSIST_AUX_TASK_KEY, {}) if isinstance(auxiliary, dict) else {}
-    if not isinstance(task_cfg, dict):
-        return False
-    return any(
-        key in task_cfg
-        for key in ("provider", "model", "base_url", "api_key", "api_mode")
-    )
-
-
 def _resolve_assist_runtime(cfg: dict[str, Any]) -> tuple[dict[str, Any], str]:
-    """Resolve runtime + model for HA Assist.
-
-    Default behavior preserves the existing main-model routing. When the user
-    explicitly configures ``auxiliary.voice_stack_assist`` in Hermes config,
-    Assist queries switch to that auxiliary provider/model instead.
-    """
+    """Resolve runtime + model for HA Assist from the active profile's main model."""
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
     model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
@@ -301,25 +291,129 @@ def _resolve_assist_runtime(cfg: dict[str, Any]) -> tuple[dict[str, Any], str]:
         raw_provider = str(model_cfg.get("provider") or "").strip().lower()
         effective_provider = raw_provider or None
 
-    if not _assist_auxiliary_configured(cfg):
-        runtime = resolve_runtime_provider(
-            requested=effective_provider,
-            target_model=effective_model or None,
-        )
-        return runtime, effective_model
-
-    from agent.auxiliary_client import _resolve_task_provider_model
-
-    requested, resolved_model, resolved_base_url, resolved_api_key, _resolved_api_mode = _resolve_task_provider_model(
-        _ASSIST_AUX_TASK_KEY
-    )
     runtime = resolve_runtime_provider(
-        requested=requested,
-        explicit_base_url=resolved_base_url,
-        explicit_api_key=resolved_api_key,
-        target_model=resolved_model or effective_model or None,
+        requested=effective_provider,
+        target_model=effective_model or None,
     )
-    return runtime, str(resolved_model or effective_model or "").strip()
+    return runtime, effective_model
+
+
+def _assist_toolsets(cfg: dict[str, Any]) -> list[str]:
+    """Return cli toolsets configured for the active Hermes profile."""
+    from hermes_cli.tools_config import _get_platform_tools
+
+    return sorted(_get_platform_tools(cfg, "cli"))
+
+
+def _assist_max_iterations(cfg: dict[str, Any]) -> int:
+    agent_cfg = cfg.get("agent", {}) if isinstance(cfg, dict) else {}
+    try:
+        return max(1, int(agent_cfg.get("max_turns") or 90))
+    except (TypeError, ValueError):
+        return 90
+
+
+def _assist_agent_signature(
+    cfg: dict[str, Any],
+    runtime: dict[str, Any],
+    effective_model: str,
+    toolsets: list[str],
+) -> tuple[Any, ...]:
+    from hermes_cli.fallback_config import get_fallback_chain
+
+    return (
+        effective_model,
+        runtime.get("provider"),
+        runtime.get("base_url"),
+        runtime.get("api_mode"),
+        tuple(toolsets),
+        _assist_max_iterations(cfg),
+        tuple(get_fallback_chain(cfg) or []),
+    )
+
+
+def _get_assist_session_db():
+    """Reuse one SessionDB for warm Assist agents in this process."""
+    global _ASSIST_SESSION_DB
+    if _ASSIST_SESSION_DB is None:
+        _ASSIST_SESSION_DB = _create_session_db_for_assist()
+    return _ASSIST_SESSION_DB
+
+
+def _build_assist_agent(
+    cfg: dict[str, Any],
+    runtime: dict[str, Any],
+    effective_model: str,
+    toolsets: list[str],
+):
+    from hermes_cli.fallback_config import get_fallback_chain
+    from run_agent import AIAgent
+
+    return AIAgent(
+        api_key=runtime.get("api_key"),
+        base_url=runtime.get("base_url"),
+        provider=runtime.get("provider"),
+        api_mode=runtime.get("api_mode"),
+        model=effective_model,
+        max_iterations=_assist_max_iterations(cfg),
+        enabled_toolsets=toolsets,
+        quiet_mode=True,
+        platform="cli",
+        session_db=_get_assist_session_db(),
+        credential_pool=runtime.get("credential_pool"),
+        fallback_model=get_fallback_chain(cfg) or None,
+        ephemeral_system_prompt=_build_assist_system_prompt(),
+    )
+
+
+def _get_warm_assist_agent(cfg: dict[str, Any]):
+    """Return a process-local Assist agent, rebuilding only when profile config changes."""
+    global _ASSIST_AGENT, _ASSIST_AGENT_SIGNATURE
+
+    runtime, effective_model = _resolve_assist_runtime(cfg)
+    toolsets = _assist_toolsets(cfg)
+    signature = _assist_agent_signature(cfg, runtime, effective_model, toolsets)
+
+    with _ASSIST_AGENT_LOCK:
+        if _ASSIST_AGENT is not None and _ASSIST_AGENT_SIGNATURE == signature:
+            return _ASSIST_AGENT
+
+        if _ASSIST_AGENT is not None:
+            try:
+                _ASSIST_AGENT.close()
+            except Exception as exc:
+                logger.debug("Warm Assist agent close failed during rebuild: %s", exc)
+            _ASSIST_AGENT = None
+            _ASSIST_AGENT_SIGNATURE = None
+
+        agent = _build_assist_agent(cfg, runtime, effective_model, toolsets)
+        agent.suppress_status_output = True
+        agent.stream_delta_callback = None
+        agent.tool_gen_callback = None
+        _ASSIST_AGENT = agent
+        _ASSIST_AGENT_SIGNATURE = signature
+        logger.info(
+            "Warm Assist agent ready: model=%s provider=%s toolsets=%s",
+            effective_model,
+            runtime.get("provider"),
+            ",".join(toolsets) or "<none>",
+        )
+        return _ASSIST_AGENT
+
+
+def reset_warm_assist_agent() -> None:
+    """Drop the cached Assist agent (tests and receiver shutdown)."""
+    global _ASSIST_AGENT, _ASSIST_AGENT_SIGNATURE, _ASSIST_SESSION_DB
+
+    with _ASSIST_AGENT_LOCK:
+        if _ASSIST_AGENT is not None:
+            try:
+                _ASSIST_AGENT.close()
+            except Exception as exc:
+                logger.debug("Warm Assist agent close failed during reset: %s", exc)
+        _ASSIST_AGENT = None
+        _ASSIST_AGENT_SIGNATURE = None
+        _ASSIST_SESSION_DB = None
 
 
 def run_local_assist_query(
@@ -343,39 +437,13 @@ def run_local_assist_query(
         }
 
     from hermes_cli.config import load_config
-    from hermes_cli.fallback_config import get_fallback_chain
-    from hermes_cli.tools_config import _get_platform_tools
-    from run_agent import AIAgent
 
     cfg = load_config()
-    runtime, effective_model = _resolve_assist_runtime(cfg)
-
-    toolsets = set(_get_platform_tools(cfg, "cli"))
-    toolsets.add("homeassistant")
-    session_db = _create_session_db_for_assist()
-    fallback_chain = get_fallback_chain(cfg)
-    system_prompt = _build_assist_system_prompt()
+    agent = _get_warm_assist_agent(cfg)
+    agent.ephemeral_system_prompt = _build_assist_system_prompt()
 
     with _ASSIST_HISTORY_LOCK:
         history = list(_ASSIST_HISTORY.get(conversation_id) or [])
-
-    agent = AIAgent(
-        api_key=runtime.get("api_key"),
-        base_url=runtime.get("base_url"),
-        provider=runtime.get("provider"),
-        api_mode=runtime.get("api_mode"),
-        model=effective_model,
-        enabled_toolsets=sorted(toolsets),
-        quiet_mode=True,
-        platform="cli",
-        session_db=session_db,
-        credential_pool=runtime.get("credential_pool"),
-        fallback_model=fallback_chain or None,
-        ephemeral_system_prompt=system_prompt,
-    )
-    agent.suppress_status_output = True
-    agent.stream_delta_callback = None
-    agent.tool_gen_callback = None
 
     if language and language.lower() != "en":
         clean_text = f"Respond in language code {language}.\n\nUser request: {clean_text}"
@@ -847,34 +915,38 @@ def start_ws_receiver(host: Optional[str] = None, port: Optional[int] = None, pa
     resolved_port = int(port or os.getenv("HERMES_HA_WS_PORT", str(DEFAULT_WS_PORT)))
     resolved_path = path or os.getenv("HERMES_HA_WS_PATH", DEFAULT_WS_PATH)
 
+    result: Optional["HermesHAWebSocketServer | _AdoptedReceiver"] = None
+    start_watchdog = False
     with _WS_LOCK:
         if _WS_SERVER and _WS_SERVER.running:
             return _WS_SERVER
         if _probe_existing_receiver(resolved_host, resolved_port):
-            adopted = _adopt_external_receiver(
+            result = _adopt_external_receiver(
                 resolved_host,
                 resolved_port,
                 resolved_path,
                 reason="listener already active",
             )
-            _ensure_watchdog()
-            return adopted
-        _WS_SERVER = HermesHAWebSocketServer(resolved_host, resolved_port, resolved_path)
-        _WS_SERVER.start()
-        if _WS_SERVER.running:
-            _register_shutdown_hook()
-            _ensure_watchdog()
-            return _WS_SERVER
-        if _probe_existing_receiver(resolved_host, resolved_port):
-            adopted = _adopt_external_receiver(
-                resolved_host,
-                resolved_port,
-                resolved_path,
-                reason="local bind failed but external listener is healthy",
-            )
-            _ensure_watchdog()
-            return adopted
-        return None
+            start_watchdog = _is_gateway_process()
+        else:
+            _WS_SERVER = HermesHAWebSocketServer(resolved_host, resolved_port, resolved_path)
+            _WS_SERVER.start()
+            if _WS_SERVER.running:
+                _register_shutdown_hook()
+                result = _WS_SERVER
+                start_watchdog = True
+            elif _probe_existing_receiver(resolved_host, resolved_port):
+                result = _adopt_external_receiver(
+                    resolved_host,
+                    resolved_port,
+                    resolved_path,
+                    reason="local bind failed but external listener is healthy",
+                )
+                start_watchdog = _is_gateway_process()
+
+    if start_watchdog:
+        _ensure_watchdog()
+    return result
 
 
 def stop_ws_receiver() -> None:
@@ -886,3 +958,4 @@ def stop_ws_receiver() -> None:
         _WS_SERVER = None
     if server is not None and isinstance(server, HermesHAWebSocketServer):
         server.stop()
+    reset_warm_assist_agent()
