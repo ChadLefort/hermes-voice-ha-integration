@@ -51,7 +51,7 @@ _MESSAGE_COUNTERS: dict[str, int] = {}
 _COUNTER_LOCK = threading.Lock()
 _VOICE_ACTION_RESERVED_KEYS = {"type", "action", "args"}
 _ASSIST_HISTORY_LOCK = threading.Lock()
-_ASSIST_HISTORY: dict[str, list[dict[str, Any]]] = {}
+_ASSIST_HISTORY: dict[str, dict[str, Any]] = {}
 _ASSIST_AGENT_LOCK = threading.RLock()
 _ASSIST_AGENT: Optional[Any] = None
 _ASSIST_AGENT_SIGNATURE: Optional[tuple[Any, ...]] = None
@@ -112,6 +112,16 @@ def _env_float(name: str, default: float) -> float:
         return default
     try:
         return max(0.0, float(raw))
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(0, int(raw))
     except ValueError:
         return default
 
@@ -243,6 +253,145 @@ def _json_loads_maybe(value: Any) -> dict[str, Any]:
         except json.JSONDecodeError:
             return {"message": value}
     return {"value": value}
+
+
+def _assist_history_key(conversation_id: str) -> str:
+    day = time.strftime("%Y-%m-%d", time.localtime())
+    return f"{day}:{conversation_id}"
+
+
+def _assist_history_idle_ttl_seconds() -> float:
+    return _env_float("HERMES_HA_ASSIST_HISTORY_IDLE_TTL_SECONDS", 7200.0)
+
+
+def _assist_history_max_age_seconds() -> float:
+    return _env_float("HERMES_HA_ASSIST_HISTORY_MAX_AGE_SECONDS", 86400.0)
+
+
+def _assist_history_max_turns() -> int:
+    return _env_int("HERMES_HA_ASSIST_HISTORY_MAX_TURNS", 40)
+
+
+def _assist_history_max_chars() -> int:
+    return _env_int("HERMES_HA_ASSIST_HISTORY_MAX_CHARS", 80000)
+
+
+def _assist_history_max_sessions() -> int:
+    return _env_int("HERMES_HA_ASSIST_HISTORY_MAX_SESSIONS", 32)
+
+
+def _assist_message_chars(message: dict[str, Any]) -> int:
+    try:
+        return len(json.dumps(message, ensure_ascii=False, default=str))
+    except (TypeError, ValueError):
+        return len(str(message))
+
+
+def _assist_messages_chars(messages: list[dict[str, Any]]) -> int:
+    return sum(_assist_message_chars(message) for message in messages)
+
+
+def _split_assist_turns(messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    turns: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+
+    for message in messages:
+        role = str(message.get("role") or "").lower()
+        if role == "user" and current:
+            turns.append(current)
+            current = []
+        current.append(message)
+
+    if current:
+        turns.append(current)
+
+    return turns
+
+
+def _prune_assist_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    max_turns = _assist_history_max_turns()
+    max_chars = _assist_history_max_chars()
+    if max_turns == 0 and max_chars == 0:
+        return []
+
+    turns = _split_assist_turns(messages)
+    if not turns:
+        return []
+
+    kept_turns: list[list[dict[str, Any]]] = []
+    kept_chars = 0
+    for turn in reversed(turns):
+        turn_chars = _assist_messages_chars(turn)
+        next_turn_count = len(kept_turns) + 1
+        over_turns = max_turns > 0 and next_turn_count > max_turns
+        over_chars = max_chars > 0 and kept_turns and (kept_chars + turn_chars) > max_chars
+        if over_turns or over_chars:
+            break
+        kept_turns.insert(0, turn)
+        kept_chars += turn_chars
+
+    if not kept_turns:
+        kept_turns = [turns[-1]]
+
+    return [message for turn in kept_turns for message in turn]
+
+
+def _prune_assist_sessions(now: float) -> None:
+    idle_ttl = _assist_history_idle_ttl_seconds()
+    max_age = _assist_history_max_age_seconds()
+    expired: list[str] = []
+
+    for key, record in _ASSIST_HISTORY.items():
+        created_at = float(record.get("created_at") or now)
+        updated_at = float(record.get("updated_at") or created_at)
+        too_idle = idle_ttl > 0 and (now - updated_at) > idle_ttl
+        too_old = max_age > 0 and (now - created_at) > max_age
+        if too_idle or too_old:
+            expired.append(key)
+
+    for key in expired:
+        _ASSIST_HISTORY.pop(key, None)
+
+    max_sessions = _assist_history_max_sessions()
+    if max_sessions <= 0:
+        _ASSIST_HISTORY.clear()
+        return
+
+    if len(_ASSIST_HISTORY) <= max_sessions:
+        return
+
+    by_updated = sorted(
+        _ASSIST_HISTORY.items(),
+        key=lambda item: float(item[1].get("updated_at") or item[1].get("created_at") or now),
+    )
+    for key, _record in by_updated[: len(_ASSIST_HISTORY) - max_sessions]:
+        _ASSIST_HISTORY.pop(key, None)
+
+
+def _get_assist_history(conversation_id: str) -> tuple[str, list[dict[str, Any]]]:
+    now = time.time()
+    key = _assist_history_key(conversation_id)
+    with _ASSIST_HISTORY_LOCK:
+        _prune_assist_sessions(now)
+        record = _ASSIST_HISTORY.get(key)
+        if not record:
+            return key, []
+        messages = record.get("messages")
+        if not isinstance(messages, list):
+            return key, []
+        record["updated_at"] = now
+        return key, list(_prune_assist_messages(messages))
+
+
+def _set_assist_history(key: str, messages: list[dict[str, Any]]) -> None:
+    now = time.time()
+    pruned_messages = _prune_assist_messages(messages)
+    with _ASSIST_HISTORY_LOCK:
+        record = _ASSIST_HISTORY.get(key) or {"created_at": now}
+        record["messages"] = pruned_messages
+        record["updated_at"] = now
+        _ASSIST_HISTORY[key] = record
+        _prune_assist_sessions(now)
 
 
 def _create_session_db_for_assist():
@@ -414,6 +563,8 @@ def reset_warm_assist_agent() -> None:
         _ASSIST_AGENT = None
         _ASSIST_AGENT_SIGNATURE = None
         _ASSIST_SESSION_DB = None
+    with _ASSIST_HISTORY_LOCK:
+        _ASSIST_HISTORY.clear()
 
 
 def run_local_assist_query(
@@ -442,8 +593,7 @@ def run_local_assist_query(
     agent = _get_warm_assist_agent(cfg)
     agent.ephemeral_system_prompt = _build_assist_system_prompt()
 
-    with _ASSIST_HISTORY_LOCK:
-        history = list(_ASSIST_HISTORY.get(conversation_id) or [])
+    history_key, history = _get_assist_history(conversation_id)
 
     if language and language.lower() != "en":
         clean_text = f"Respond in language code {language}.\n\nUser request: {clean_text}"
@@ -461,8 +611,7 @@ def run_local_assist_query(
 
     messages = result.get("messages")
     if isinstance(messages, list):
-        with _ASSIST_HISTORY_LOCK:
-            _ASSIST_HISTORY[conversation_id] = messages
+        _set_assist_history(history_key, messages)
 
     return {
         "type": "assist_response",

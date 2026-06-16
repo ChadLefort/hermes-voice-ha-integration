@@ -333,6 +333,42 @@ Do **not** enter `http://homeassistant.local:8123` in the Hermes URL field. That
 
 This integration registers a Home Assistant Assist conversation agent (`HermesConversationAgent`) on the `Platform.CONVERSATION` platform and handles both incoming `assist_query` and outgoing `assist_response` WebSocket messages. After setup, Hermes will appear in the **Preferred conversation agent** selector under **Settings → Voice assistants**.
 
+### HA Assist conversation history and cold starts
+
+HA Assist voice history is bounded separately from normal Hermes profile sessions. This keeps the gateway's warm Assist agent alive for lower cold-start latency, but prevents one reused Home Assistant `conversation_id` from growing forever and increasing model context usage.
+
+Only HA Assist traffic through `plugins/voice_stack/ws_receiver.py` uses this history window. Cron jobs and normal Hermes profile sessions are not changed by these limits.
+
+The receiver keys HA Assist history by day plus Home Assistant conversation ID:
+
+```text
+YYYY-MM-DD:<conversation_id>
+```
+
+History pruning is turn-safe. Hermes trims whole user turns, so tool-heavy turns such as web searches keep the assistant tool call, tool result, and final assistant response together. It does not cut halfway through an active tool exchange.
+
+Default limits:
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `HERMES_HA_ASSIST_HISTORY_IDLE_TTL_SECONDS` | `7200` | Drop HA Assist sessions idle for more than 2 hours. |
+| `HERMES_HA_ASSIST_HISTORY_MAX_AGE_SECONDS` | `86400` | Drop HA Assist sessions older than 1 day. |
+| `HERMES_HA_ASSIST_HISTORY_MAX_TURNS` | `40` | Keep up to 40 recent complete user turns. |
+| `HERMES_HA_ASSIST_HISTORY_MAX_CHARS` | `80000` | Keep recent complete turns under this approximate JSON character budget. A single latest turn is kept whole even if large. |
+| `HERMES_HA_ASSIST_HISTORY_MAX_SESSIONS` | `32` | Keep at most 32 active HA Assist histories in memory. |
+
+Example override:
+
+```bash
+cat >> ~/.hermes/.env <<'EOF'
+HERMES_HA_ASSIST_HISTORY_IDLE_TTL_SECONDS=14400
+HERMES_HA_ASSIST_HISTORY_MAX_TURNS=60
+HERMES_HA_ASSIST_HISTORY_MAX_CHARS=120000
+EOF
+```
+
+Restart the Hermes gateway after changing these values. Restarting is only needed for config changes; day/idle/turn pruning happens automatically during Assist queries.
+
 > **Important:** The Hermes Agent server must handle the `assist_query` and `assist_response` WebSocket message types for the conversation pipeline to work end-to-end. The HA integration forwards queries and awaits responses, but if the Hermes Agent does not recognise these message types, conversation queries time out after 30 seconds. See [Hermes Agent WebSocket message types](#hermes-agent-websocket-message-types) below for the protocol contract.
 
 5. Submit.

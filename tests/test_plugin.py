@@ -1064,6 +1064,48 @@ class TestWarmAssistAgent:
         assert ws_receiver._ASSIST_AGENT is None
         assert ws_receiver._ASSIST_AGENT_SIGNATURE is None
 
+    def test_prune_assist_messages_keeps_whole_tool_turns(self, monkeypatch):
+        from plugins.voice_stack import ws_receiver
+
+        monkeypatch.setenv("HERMES_HA_ASSIST_HISTORY_MAX_TURNS", "1")
+        monkeypatch.setenv("HERMES_HA_ASSIST_HISTORY_MAX_CHARS", "0")
+        messages = [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "look this up"},
+            {"role": "assistant", "tool_calls": [{"id": "call-1", "name": "web_search"}]},
+            {"role": "tool", "tool_call_id": "call-1", "content": "search result"},
+            {"role": "assistant", "content": "found it"},
+        ]
+
+        assert ws_receiver._prune_assist_messages(messages) == messages[2:]
+
+    def test_get_assist_history_uses_daily_key_and_prunes_idle_sessions(self, monkeypatch):
+        from plugins.voice_stack import ws_receiver
+
+        monkeypatch.setenv("HERMES_HA_ASSIST_HISTORY_IDLE_TTL_SECONDS", "10")
+        monkeypatch.setenv("HERMES_HA_ASSIST_HISTORY_MAX_AGE_SECONDS", "0")
+        monkeypatch.setenv("HERMES_HA_ASSIST_HISTORY_MAX_SESSIONS", "32")
+        monkeypatch.setattr(ws_receiver.time, "time", lambda: 100.0)
+        monkeypatch.setattr(ws_receiver.time, "strftime", lambda *a, **k: "2026-06-16")
+
+        ws_receiver._ASSIST_HISTORY["2026-06-16:stale"] = {
+            "created_at": 1.0,
+            "updated_at": 1.0,
+            "messages": [{"role": "user", "content": "old"}],
+        }
+        ws_receiver._ASSIST_HISTORY["2026-06-16:active"] = {
+            "created_at": 95.0,
+            "updated_at": 95.0,
+            "messages": [{"role": "user", "content": "recent"}],
+        }
+
+        key, history = ws_receiver._get_assist_history("active")
+
+        assert key == "2026-06-16:active"
+        assert history == [{"role": "user", "content": "recent"}]
+        assert "2026-06-16:stale" not in ws_receiver._ASSIST_HISTORY
+
 
 class TestVoiceWebSocketReceiverHardening:
     """Resilience tests for the HA-facing WebSocket receiver."""
